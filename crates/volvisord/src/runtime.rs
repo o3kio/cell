@@ -31,6 +31,7 @@ use crate::handoff::{
     migration_records_dir, migration_witness_probe, peer_preparations_dir,
     spawn_migration_retry_task, wire_migration,
 };
+use crate::notify;
 
 /// The witness request timeout for the blocking adapter: bounds every
 /// control-path witness wait (the engine holds its state lock across
@@ -763,6 +764,16 @@ pub async fn serve(config: Config) -> Result<(), DaemonError> {
         .await
         .map_err(|e| DaemonError::Http(format!("bind {}: {e}", config.listen)))?;
     tracing::info!(listen = %config.listen, "volvisor API serving");
+    // P7-B (ADR-0009's service model): READY=1 only now — startup
+    // reconciliation completed above (`build_state`: journal lock +
+    // replay, provider construction and its reconcile) and the
+    // listener is bound. Every failure path before this line returns
+    // without notifying: under Type=notify the service manager reads
+    // that as a start failure and applies the unit's restart policy,
+    // re-entering this same idempotent path. A send failure is
+    // logged, never fatal (`notify` module docs). The ordering is
+    // pinned from both sides in tests/notify_e2e.rs.
+    notify::ready("volvisord");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await

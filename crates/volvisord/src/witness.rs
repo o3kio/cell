@@ -30,6 +30,7 @@ use volvisor_witness::registry::WitnessCore;
 use volvisor_witness::server::{WitnessServerState, router};
 
 use crate::DaemonError;
+use crate::notify;
 use crate::runtime::shutdown_signal;
 
 /// Load and validate a witness configuration from a TOML file.
@@ -101,6 +102,12 @@ pub async fn serve(config: WitnessConfig) -> Result<(), DaemonError> {
         host_credentials = config.host_tokens.len(),
         "volvisor-witnessd serving (protocol v2; prototype; not production supported)"
     );
+    // P7-B (ADR-0009's service model): READY=1 only now — the
+    // witness journal is open (lock + replay, above) and the
+    // listener is bound, mirroring the storage daemon's readiness
+    // discipline. Failure paths return before this line; a send
+    // failure is logged, never fatal (`notify` module docs).
+    notify::ready("volvisor-witnessd");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await

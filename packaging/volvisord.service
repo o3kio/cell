@@ -1,0 +1,155 @@
+# volvisord.service — the Volvisor storage daemon (P7-B, per
+# ADR-0009's service model; one package ships both daemons, this unit
+# is the storage daemon's).
+#
+# Readiness (Type=notify): the daemon sends READY=1 only after
+# startup reconciliation completes — journal lock + replay, provider
+# construction and its reconcile — and the API listener is bound. A
+# daemon that is up but not reconciled (or reconciled but not
+# serving) never reports ready; the service manager reads that as a
+# start failure at TimeoutStartSec, and Restart=on-failure re-enters
+# the same path (replay and reconcile are idempotent by design). A
+# notify-send failure inside the daemon is logged as a warning,
+# never fatal: the manager's own timeout remains the operator's
+# signal, and the daemon keeps serving in the meantime.
+#
+# Root reality: the daemon claims host devices and drives the LVM and
+# DRBD control paths (device-mapper ioctls, genetlink, /dev access),
+# so it runs as root. The hardening below is the set that does not
+# contradict that reality. Directives deliberately omitted, and why:
+#   User=/Group=          — no unprivileged mode exists to declare;
+#                          device claiming, device-mapper and DRBD
+#                          ioctls and the runtime socket directory
+#                          all require root.
+#   PrivateDevices        — the daemon's purpose is /dev access
+#                          (loop devices, DRBD minors, /dev/disk/*).
+#   ProcSubset            — the DRBD provider observes /proc/drbd.
+# The capability bounding set is reduced, not omitted — see its
+# comment block below the hardening directives.
+# Anything not listed was not evaluated here; P7-C's container smoke
+# (packaging/README.md) is the runtime verification boundary.
+
+[Unit]
+Description=Volvisor storage daemon (volume virtualization; prototype)
+Documentation=https://github.com/o3kio/volvisor
+# The listen address is operator configuration; a non-loopback bind
+# (the production shape) wants the stack up before we claim to serve.
+After=network.target
+
+[Service]
+Type=notify
+# The outer start bound: a healthy reconcile (journal replay +
+# provider reconcile over external CLIs) is single-digit seconds,
+# tens on large hosts with cold udev caches — and every external
+# command the daemon runs is individually bounded. 120s is the
+# backstop that catches a wedged startup, far above any healthy
+# reconcile, while Type=notify makes reaching it a start failure the
+# restart policy re-enters.
+TimeoutStartSec=120
+# The install smoke surface (P7-A): a configuration that cannot load,
+# validate and summarize fails the start before the daemon runs.
+# The CLI takes the config path on --config; --check-config is a flag.
+ExecStartPre=/usr/bin/volvisord --config /etc/volvisor/volvisor.toml --check-config
+ExecStart=/usr/bin/volvisord --config /etc/volvisor/volvisor.toml
+Restart=on-failure
+RestartSec=2s
+# Operator environment (e.g. RUST_LOG); an absent file is fine.
+EnvironmentFile=-/etc/volvisor/volvisor.env
+# Journal + provider state under /var/lib/volvisor; runtime sockets
+# (the VMM --api-socket convention) under /run/volvisor.
+RuntimeDirectory=volvisor
+StateDirectory=volvisor
+
+# --- hardening (see the header comment for the omissions) ---
+NoNewPrivileges=true
+# Everything the daemon creates (journals, provider state, runtime
+# sockets used only by its own children) is root-only.
+UMask=0077
+ProtectHome=true
+PrivateTmp=true
+ProtectSystem=strict
+# The daemon's real write set, plus the external tools':
+#   /var/lib/volvisor  journals + provider state (StateDirectory=)
+#   /run/volvisor      runtime sockets (RuntimeDirectory=)
+#   /etc/lvm/archive   LVM writes a metadata archive and a backup on
+#   /etc/lvm/backup    every VG metadata change (lvcreate, lvremove,
+#                      pvmove, vgextend...); without these every LVM
+#                      mutation fails
+#   -/etc/lvm/cache    the LVM device cache (write_cache_state); '-'
+#                      because the directory exists only after the
+#                      first write on some installs
+#   -/run/lvm          LVM's runtime state (hints, pvs_online,
+#                      vgs_online — opened O_RDWR on every
+#                      mutation per LVM 2.03; EROFS is non-fatal
+#                      cache/hints degradation, but the write is
+#                      real); '-': created by lvm at first use
+#   -/run/lock/lvm     LVM's global lock directory (lvm2's own
+#                      tmpfiles.d creates it at boot); '-'
+#   -/etc/drbd.d       the DRBD provider's resource configs (present
+#                      when drbd-utils is installed)
+#   -/var/lib/drbd     drbd-utils state/runtime dirs; '-': absent
+#   -/run/drbd         without drbd-utils, included conservatively
+#   -/sys/bus/rbd      the ceph provider's attach path maps images
+#                      (`rbd map`), which writes /sys/bus/rbd/add —
+#                      a kernel interface, not a filesystem write,
+#                      that ProtectKernelTunables' read-only /sys
+#                      would otherwise block. ReadWritePaths
+#                      re-widenes the subtree (verified as a
+#                      mechanism in the P7-B smoke; the rbd-specific
+#                      behavior is P7-C's real-cluster smoke). '-':
+#                      exists only where the rbd module is loaded.
+ReadWritePaths=/var/lib/volvisor /run/volvisor /etc/lvm/archive /etc/lvm/backup -/etc/lvm/cache -/run/lvm -/run/lock/lvm -/etc/drbd.d -/var/lib/drbd -/run/drbd -/sys/bus/rbd
+ProtectKernelTunables=true
+ProtectKernelModules=true
+# The DRBD kernel module is a host property loaded by the host's DRBD
+# service, never by this daemon; blocking module loading here is the
+# point (an auto-modprobe attempt fails typed instead).
+# A reduced capability bounding set (F-2 of the PR #25 review): the
+# daemon and every child it spawns (lvm, drbdadm, drbdsetup,
+# blockdev, ch-remote, ceph/rbd) keep only what that real syscall
+# surface justifies. Uncertain capabilities are RETAINED, not
+# dropped: fail-open on retention is the availability-safe direction
+# (a dropped-but-needed capability is a typed mid-flight failure).
+#   CAP_SYS_ADMIN       — device-mapper ioctls (dm-ioctl checks
+#                         capable(CAP_SYS_ADMIN)) and loop-device
+#                         configuration ioctls: the device-claim and
+#                         LV surfaces.
+#   CAP_NET_ADMIN       — drbdsetup's DRBD generic-netlink admin
+#                         operations (GENL_ADMIN_PERM).
+#   CAP_DAC_OVERRIDE    — device nodes and foreign-owned paths
+#                         (block devices are commonly root:disk
+#                         0660: root's classic device access).
+#   CAP_FOWNER          — RETAINED UNDER UNCERTAINTY: drbd-utils is
+#                         not installed in the development sandbox,
+#                         so its housekeeping on /var/lib/drbd could
+#                         not be observed; attribute-setting on
+#                         foreign files cannot be ruled out.
+#   CAP_MKNOD           — libdevmapper's direct device-node creation
+#                         fallback when udev coordination is absent
+#                         (a real lvm deployment mode).
+#   CAP_NET_BIND_SERVICE — the API listener's port is operator
+#                         configuration; privileged ports stay
+#                         bindable.
+# Everything else is dropped — CAP_SYS_BOOT, CAP_SYS_TIME,
+# CAP_SYS_PTRACE, CAP_SYS_MODULE (consistent with
+# ProtectKernelModules above), CAP_SYS_NICE, CAP_NET_RAW,
+# CAP_KILL (the daemon only signals its own children), the
+# setuid/setgid/setpcap family, CAP_SYS_RESOURCE, CAP_SYS_RAWIO,
+# CAP_SYSLOG, the audit and MAC families, CAP_LEASE (the journal's
+# flock needs no capability), CAP_IPC_LOCK, BPF, PERFMON,
+# CHECKPOINT_RESTORE among them.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_DAC_OVERRIDE CAP_FOWNER CAP_MKNOD CAP_NET_BIND_SERVICE
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# AF_UNIX — the runtime/VMM sockets and udev's control socket;
+# AF_INET/AF_INET6 — the API listener, DRBD replication, ceph
+#                      monitors;
+# AF_NETLINK — drbdsetup's generic netlink, and conservatively lvm's
+#                      optional libudev integration (kobject uevents)
+#                      where a distro build enables it.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

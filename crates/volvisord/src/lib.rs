@@ -7,7 +7,9 @@
 //! 2. initialize structured logging (JSON, no secret material);
 //! 3. acquire the journal lock and replay the intent journal;
 //! 4. construct the configured provider and reconcile observed state;
-//! 5. serve the Volume API v2 HTTP surface.
+//! 5. bind the listener, notify the service manager (`READY=1` over
+//!    `$NOTIFY_SOCKET`, P7-B — a no-op when unset), and serve the
+//!    Volume API v2 HTTP surface.
 //!
 //! Control-plane outage behavior (inherited v1 requirement, SPEC-0002
 //! section 13): losing consumer connectivity never detaches healthy
@@ -19,6 +21,7 @@
 
 pub mod config;
 pub mod handoff;
+mod notify;
 pub mod runtime;
 pub mod version;
 pub mod witness;

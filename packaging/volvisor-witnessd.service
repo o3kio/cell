@@ -1,0 +1,78 @@
+# volvisor-witnessd.service — the Volvisor witness daemon (P7-B, per
+# ADR-0009's service model): the third-party writer-authority
+# service. Deliberately NOT a storage daemon — it holds no volume
+# provider, spawns no external tools and touches no devices, so this
+# unit is strictly tighter than the storage daemon's where that
+# narrower reality allows (PrivateDevices below, no AF_NETLINK, a
+# one-directory write set, a one-capability bounding set).
+#
+# Readiness (Type=notify): READY=1 only after the witness journal is
+# open (lock + replay — a competing witness on the same state
+# directory fails there, not mid-flight) and the listener is bound.
+# Restart re-enters the same idempotent path. A notify-send failure
+# inside the daemon is logged, never fatal — the manager's own start
+# timeout is the operator's signal.
+#
+# Deployment honesty (P4a plan §3): the witness must be a third
+# failure domain by deployment; volvisor cannot verify placement —
+# the operator's network topology does. After=network.target keeps
+# the listener from racing the stack on hosts that bring addresses
+# up late.
+
+[Unit]
+Description=Volvisor witness daemon (writer authority; prototype)
+Documentation=https://github.com/o3kio/volvisor
+After=network.target
+
+[Service]
+Type=notify
+# The witness's startup is purely in-process (journal open + replay,
+# bind — no external CLIs, unlike the storage daemon); 30s is far
+# above any healthy open+bind while still bounding a wedged start
+# under Type=notify.
+TimeoutStartSec=30
+# The install smoke surface (P7-A): the witness config must load,
+# validate and summarize before the daemon runs.
+ExecStartPre=/usr/bin/volvisor-witnessd --config /etc/volvisor/witnessd.toml --check-config
+ExecStart=/usr/bin/volvisor-witnessd --config /etc/volvisor/witnessd.toml
+Restart=on-failure
+RestartSec=2s
+EnvironmentFile=-/etc/volvisor/volvisor.env
+# The example witness configuration keeps its journal under
+# /var/lib/volvisor-witness/state — a separate tree from the storage
+# daemon's, because a witness is not a storage daemon. No
+# RuntimeDirectory: the witness owns no runtime sockets.
+StateDirectory=volvisor-witness
+
+# --- hardening (the storage daemon's set, plus what the witness's
+# --- device-free reality additionally permits) ---
+NoNewPrivileges=true
+# Everything the witness creates (its journal) is root-only.
+UMask=0077
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+# The witness's write set is exactly its journal tree.
+ReadWritePaths=/var/lib/volvisor-witness
+ProtectKernelTunables=true
+ProtectKernelModules=true
+# The witness's capability needs are narrower than the storage
+# daemon's (it runs no external tools and owns no devices): its own
+# journal files are owner-accessible without capabilities, its flock
+# needs none, and the one genuine maybe is binding a privileged
+# port, which is operator configuration — kept per the same
+# retain-under-uncertainty rule as the storage daemon's set.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# AF_INET/AF_INET6 — the witness listener. AF_UNIX — nothing the
+# witness creates itself; kept for the resolver's nscd convention and
+# inherited logging descriptors, at no exposure cost. No AF_NETLINK:
+# the witness runs no external tools (no udev, no drbdsetup).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
