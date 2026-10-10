@@ -23,19 +23,29 @@
 #                          all require root.
 #   PrivateDevices        — the daemon's purpose is /dev access
 #                          (loop devices, DRBD minors, /dev/disk/*).
-#   CapabilityBoundingSet — the device-mapper and DRBD ioctls need
-#                          CAP_SYS_ADMIN; a bounding set that keeps
-#                          it is not a reduction.
 #   ProcSubset            — the DRBD provider observes /proc/drbd.
+# The capability bounding set is reduced, not omitted — see its
+# comment block below the hardening directives.
 # Anything not listed was not evaluated here; P7-C's container smoke
 # (packaging/README.md) is the runtime verification boundary.
 
 [Unit]
 Description=Volvisor storage daemon (volume virtualization; prototype)
 Documentation=https://github.com/o3kio/volvisor
+# The listen address is operator configuration; a non-loopback bind
+# (the production shape) wants the stack up before we claim to serve.
+After=network.target
 
 [Service]
 Type=notify
+# The outer start bound: a healthy reconcile (journal replay +
+# provider reconcile over external CLIs) is single-digit seconds,
+# tens on large hosts with cold udev caches — and every external
+# command the daemon runs is individually bounded. 120s is the
+# backstop that catches a wedged startup, far above any healthy
+# reconcile, while Type=notify makes reaching it a start failure the
+# restart policy re-enters.
+TimeoutStartSec=120
 # The install smoke surface (P7-A): a configuration that cannot load,
 # validate and summarize fails the start before the daemon runs.
 # The CLI takes the config path on --config; --check-config is a flag.
@@ -68,18 +78,67 @@ ProtectSystem=strict
 #   -/etc/lvm/cache    the LVM device cache (write_cache_state); '-'
 #                      because the directory exists only after the
 #                      first write on some installs
+#   -/run/lvm          LVM's runtime state (hints, pvs_online,
+#                      vgs_online — opened O_RDWR on every
+#                      mutation per LVM 2.03; EROFS is non-fatal
+#                      cache/hints degradation, but the write is
+#                      real); '-': created by lvm at first use
 #   -/run/lock/lvm     LVM's global lock directory (lvm2's own
 #                      tmpfiles.d creates it at boot); '-'
 #   -/etc/drbd.d       the DRBD provider's resource configs (present
 #                      when drbd-utils is installed)
 #   -/var/lib/drbd     drbd-utils state/runtime dirs; '-': absent
 #   -/run/drbd         without drbd-utils, included conservatively
-ReadWritePaths=/var/lib/volvisor /run/volvisor /etc/lvm/archive /etc/lvm/backup -/etc/lvm/cache -/run/lock/lvm -/etc/drbd.d -/var/lib/drbd -/run/drbd
+#   -/sys/bus/rbd      the ceph provider's attach path maps images
+#                      (`rbd map`), which writes /sys/bus/rbd/add —
+#                      a kernel interface, not a filesystem write,
+#                      that ProtectKernelTunables' read-only /sys
+#                      would otherwise block. ReadWritePaths
+#                      re-widenes the subtree (verified as a
+#                      mechanism in the P7-B smoke; the rbd-specific
+#                      behavior is P7-C's real-cluster smoke). '-':
+#                      exists only where the rbd module is loaded.
+ReadWritePaths=/var/lib/volvisor /run/volvisor /etc/lvm/archive /etc/lvm/backup -/etc/lvm/cache -/run/lvm -/run/lock/lvm -/etc/drbd.d -/var/lib/drbd -/run/drbd -/sys/bus/rbd
 ProtectKernelTunables=true
 ProtectKernelModules=true
 # The DRBD kernel module is a host property loaded by the host's DRBD
 # service, never by this daemon; blocking module loading here is the
 # point (an auto-modprobe attempt fails typed instead).
+# A reduced capability bounding set (F-2 of the PR #25 review): the
+# daemon and every child it spawns (lvm, drbdadm, drbdsetup,
+# blockdev, ch-remote, ceph/rbd) keep only what that real syscall
+# surface justifies. Uncertain capabilities are RETAINED, not
+# dropped: fail-open on retention is the availability-safe direction
+# (a dropped-but-needed capability is a typed mid-flight failure).
+#   CAP_SYS_ADMIN       — device-mapper ioctls (dm-ioctl checks
+#                         capable(CAP_SYS_ADMIN)) and loop-device
+#                         configuration ioctls: the device-claim and
+#                         LV surfaces.
+#   CAP_NET_ADMIN       — drbdsetup's DRBD generic-netlink admin
+#                         operations (GENL_ADMIN_PERM).
+#   CAP_DAC_OVERRIDE    — device nodes and foreign-owned paths
+#                         (block devices are commonly root:disk
+#                         0660: root's classic device access).
+#   CAP_FOWNER          — RETAINED UNDER UNCERTAINTY: drbd-utils is
+#                         not installed in the development sandbox,
+#                         so its housekeeping on /var/lib/drbd could
+#                         not be observed; attribute-setting on
+#                         foreign files cannot be ruled out.
+#   CAP_MKNOD           — libdevmapper's direct device-node creation
+#                         fallback when udev coordination is absent
+#                         (a real lvm deployment mode).
+#   CAP_NET_BIND_SERVICE — the API listener's port is operator
+#                         configuration; privileged ports stay
+#                         bindable.
+# Everything else is dropped — CAP_SYS_BOOT, CAP_SYS_TIME,
+# CAP_SYS_PTRACE, CAP_SYS_MODULE (consistent with
+# ProtectKernelModules above), CAP_SYS_NICE, CAP_NET_RAW,
+# CAP_KILL (the daemon only signals its own children), the
+# setuid/setgid/setpcap family, CAP_SYS_RESOURCE, CAP_SYS_RAWIO,
+# CAP_SYSLOG, the audit and MAC families, CAP_LEASE (the journal's
+# flock needs no capability), CAP_IPC_LOCK, BPF, PERFMON,
+# CHECKPOINT_RESTORE among them.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_DAC_OVERRIDE CAP_FOWNER CAP_MKNOD CAP_NET_BIND_SERVICE
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true

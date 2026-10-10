@@ -4,7 +4,7 @@
 # provider, spawns no external tools and touches no devices, so this
 # unit is strictly tighter than the storage daemon's where that
 # narrower reality allows (PrivateDevices below, no AF_NETLINK, a
-# one-directory write set).
+# one-directory write set, a one-capability bounding set).
 #
 # Readiness (Type=notify): READY=1 only after the witness journal is
 # open (lock + replay — a competing witness on the same state
@@ -26,6 +26,11 @@ After=network.target
 
 [Service]
 Type=notify
+# The witness's startup is purely in-process (journal open + replay,
+# bind — no external CLIs, unlike the storage daemon); 30s is far
+# above any healthy open+bind while still bounding a wedged start
+# under Type=notify.
+TimeoutStartSec=30
 # The install smoke surface (P7-A): the witness config must load,
 # validate and summarize before the daemon runs.
 ExecStartPre=/usr/bin/volvisor-witnessd --config /etc/volvisor/witnessd.toml --check-config
@@ -52,6 +57,13 @@ ProtectSystem=strict
 ReadWritePaths=/var/lib/volvisor-witness
 ProtectKernelTunables=true
 ProtectKernelModules=true
+# The witness's capability needs are narrower than the storage
+# daemon's (it runs no external tools and owns no devices): its own
+# journal files are owner-accessible without capabilities, its flock
+# needs none, and the one genuine maybe is binding a privileged
+# port, which is operator configuration — kept per the same
+# retain-under-uncertainty rule as the storage daemon's set.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true

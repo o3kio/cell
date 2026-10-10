@@ -60,8 +60,15 @@ cannot bind never reports ready, and only the fully-started daemon's
 
 Under `ProtectSystem=strict` the entire hierarchy is read-only
 except `/dev`, `/proc`, `/sys` and the explicitly listed paths, so
-the list must cover everything the daemon **and the external tools
-it spawns** write — not just the daemon's own state:
+the list must cover the external tools' writes, not just the
+daemon's own state. The discipline, honestly stated (review finding
+F-1): **load-bearing paths are listed unconditionally** — a missing
+one should fail the unit loudly at start — while **cache/hints
+paths are best-effort with the `-` prefix**: they may not exist on
+fresh installs, and losing them degrades to tool warnings, never to
+a failed mutation. The list is researched against the tools'
+observed behavior on the reference host, not a claim of exhaustive
+coverage of every write any distro build might attempt.
 
 - `/var/lib/volvisor`, `/run/volvisor` — the daemon's journals,
   provider state, migration/handoff records, and the runtime socket
@@ -71,13 +78,16 @@ it spawns** write — not just the daemon's own state:
   `lvremove`, `pvmove`, `vgextend`, ...). These are load-bearing:
   without write access every LVM mutation fails. Both directories
   ship with the `lvm2` package (verified present on the reference
-  host, LVM 2.03.16), so they are listed without the `-` prefix — a
-  missing directory should fail the unit loudly at start, not every
-  mutation later.
+  host, LVM 2.03.16), so they are listed without the `-` prefix.
 - `-/etc/lvm/cache` — the LVM device cache (`write_cache_state`);
   commands may rewrite it when device state drifts. The directory
   does not exist on a fresh install (verified: absent on the
   reference host until first written), hence the `-` prefix.
+- `-/run/lvm` — LVM's runtime state (`hints`, `pvs_online`,
+  `vgs_online`), opened `O_RDWR` on every mutation per LVM 2.03
+  (strace-verified in review). Read-only access degrades to
+  cache/hints warnings — non-fatal — but the write is real, so the
+  path is listed. `-` because lvm creates it at first use.
 - `-/run/lock/lvm` — LVM's global lock directory, created by lvm2's
   own tmpfiles.d at boot; `-` for the same reason.
 - `-/etc/drbd.d` — where the DRBD provider writes its resource
@@ -87,6 +97,18 @@ it spawns** write — not just the daemon's own state:
   directories, included conservatively (drbd-utils is not installed
   on the reference host, so these could not be observed directly;
   the cost of including them if unused is nil).
+- `-/sys/bus/rbd` — the ceph provider's attach path maps images
+  (`rbd map`), which writes `/sys/bus/rbd/add`: a kernel interface,
+  not a filesystem write, that `ProtectKernelTunables`'s read-only
+  `/sys` would otherwise block. `ReadWritePaths` re-widenes the
+  subtree over the read-only mount (the mechanism is verified in
+  the P7-B smoke below; the rbd-specific behavior needs a real
+  cluster and is P7-C's). `-` because the path exists only where
+  the rbd module is loaded.
+- The ceph provider's other children (`ceph`, `rbd` CLIs:
+  create/remove/ls/info) are cluster-side metadata operations with
+  no local filesystem writes (review finding F-6) — no functional
+  gap in the write set beyond the sysfs carve-out above.
 - `/proc/drbd` is read, never written — readable under strict
   without a listing.
 
@@ -111,12 +133,24 @@ What is verified here:
   validation), recorded in the P7-B delivery record;
 - the readiness ordering, failure discipline and protocol payload
   pinned by the notify unit tests and the `notify_e2e` integration
-  tests above.
+  tests above;
+- a one-time **unit-start smoke on this host's real systemd** (the
+  development sandbox runs systemd 255.4 as PID 1 — review finding
+  F-3 corrected an earlier claim here that it did not): the built
+  binaries staged at `/usr/bin`, the units and a valid
+  configuration installed at their real paths, `daemon-reload`,
+  `start`, the unit observed reaching **active** through the
+  `Type=notify` READY handshake, the API answering, stop, and full
+  cleanup. The full transcript lives in the PR body (it is a
+  delivery-time observation, not a permanent test — the packaged
+  layout and its smoke belong to P7-C). The smoke also verified the
+  `ReadWritePaths`-over-`ProtectKernelTunables` re-widening
+  mechanism that the ceph `rbd map` carve-out relies on.
 
-What is **not** verified here, on purpose: the units' runtime
-behavior under a real systemd — namespace setup, `StateDirectory`
-interaction with `ProtectSystem=strict`, restart cycling, `Type=notify`
-timeouts. No systemd runs as PID 1 in the development sandbox. That
-boundary belongs to P7-C's container install smoke (unit start →
-active, readiness observed), per the plan's own evidence shape; what
-cannot be sandboxed there is recorded, not skipped.
+What is **not** verified here, on purpose: the packaged install
+itself (P7-C's `.deb`/`.rpm` container smoke: units at their package
+paths, `ExecStartPre` against the shipped example configs, restart
+cycling, upgrade paths), and provider-specific runtime behavior that
+needs real hardware or clusters (the `rbd map` carve-out against a
+live ceph host, DRBD against real peers). What cannot be sandboxed
+there is recorded, not skipped.
