@@ -174,7 +174,22 @@ evidence status stated honestly:
   `mig-api-{tag}-{16hex}` shape); the remedy direction (a namespaced
   peer-id derivation, or a per-route journal domain) is
   recorded here for the P6 hardening triage — pinned so it is not
-  silently dropped;
+  silently dropped; **resolved in PR #31: the namespaced-derivation
+  remedy. Every derived id renders in the reserved `derived:` prefix
+  (`derived:mig-api-{tag}-{16hex}` for the mobility and peer acts,
+  `derived:mig-attach-{16hex}` for the promote attach identity, which
+  doubles as the derived attachment id the provider's attach
+  idempotency keys on), and every consumer route that journals a
+  consumer-supplied id — thirteen routes, volume through lending —
+  refuses the prefix typed `INVALID_REQUEST` naming the reserved
+  namespace, before any journal write (a refusal under a reserved id
+  journals nothing, so it can never become the pre-claim record the
+  wedge needed). The derivation stays deterministic per migration and
+  act, so PR #23's re-issue machinery is untouched: the healed-wedge
+  rows and the peer re-drive tests run green at the fix's head, and
+  both directions of unreachability are pinned by tests (derived ids
+  always carry the prefix; the prefix is refused at every consumer
+  route — including the attachment id on the attach route)**;
 - the **Tier R real-host drive** — the 8 gates are scaffolded, skipped
   honestly, and fail loudly under `VOLVISOR_CAMPAIGN_TIER=R`.
 

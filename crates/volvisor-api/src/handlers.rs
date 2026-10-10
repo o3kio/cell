@@ -43,6 +43,7 @@ pub(crate) async fn create_volume(
     ValidJson(req): ValidJson<CreateVolumeRequest>,
 ) -> Result<Response, ApiErrorReply> {
     req.validate()?;
+    ops::require_consumer_operation_id(&req.operation_id)?;
     tracing::info!(
         kind = ops::OP_CREATE_VOLUME,
         operation_id = %req.operation_id,
@@ -103,6 +104,13 @@ pub(crate) async fn attach_volume(
     ValidJson(req): ValidJson<AttachVolumeRequest>,
 ) -> Result<Response, ApiErrorReply> {
     req.validate()?;
+    // Both consumer-suppliable identity fields: the reserved prefix
+    // is refused for the operation id like every consumer route, and
+    // for the attachment id because the promote attach's derived
+    // attachment identity lives in that namespace (the provider keys
+    // attach idempotency by attachment id).
+    ops::require_consumer_operation_id(&req.operation_id)?;
+    ops::require_consumer_attachment_id(&req.attachment_id)?;
     let volume_id = parse_volume_id(&volume_id)?;
     tracing::info!(
         kind = ops::OP_ATTACH_VOLUME,
@@ -140,6 +148,7 @@ pub(crate) async fn detach_volume(
     let attachment_id = wire.attachment_id.clone();
     let req = wire.into_typed_request();
     req.validate()?;
+    ops::require_consumer_operation_id(&req.operation_id)?;
     tracing::info!(
         kind = ops::OP_DETACH_VOLUME,
         operation_id = %req.operation_id,
@@ -185,6 +194,7 @@ pub(crate) async fn grow_volume(
 ) -> Result<Response, ApiErrorReply> {
     let volume_id = parse_volume_id(&volume_id)?;
     req.validate_envelope()?;
+    ops::require_consumer_operation_id(&req.operation_id)?;
     tracing::info!(
         kind = ops::OP_GROW_VOLUME,
         operation_id = %req.operation_id,
@@ -256,6 +266,7 @@ pub(crate) async fn move_volume_backing(
 ) -> Result<Response, ApiErrorReply> {
     let volume_id = parse_volume_id(&volume_id)?;
     req.validate_envelope()?;
+    ops::require_consumer_operation_id(&req.operation_id)?;
     tracing::info!(
         kind = ops::OP_MOVE_VOLUME_BACKING,
         operation_id = %req.operation_id,
@@ -285,6 +296,7 @@ pub(crate) async fn delete_volume(
     ValidJson(req): ValidJson<DeleteVolumeRequest>,
 ) -> Result<Response, ApiErrorReply> {
     req.validate()?;
+    ops::require_consumer_operation_id(&req.operation_id)?;
     let volume_id = parse_volume_id(&volume_id)?;
     tracing::info!(
         kind = ops::OP_DELETE_VOLUME,
@@ -377,6 +389,7 @@ pub(crate) async fn claim_device(
         .clone()
         .ok_or_else(|| ApiErrorReply(admin_surface_unavailable()))?;
     req.validate()?;
+    ops::require_consumer_operation_id(&req.operation_id)?;
     let device_id = parse_device_id(&device_id)?;
     tracing::info!(
         kind = ops::OP_CLAIM_DEVICE,
@@ -413,6 +426,7 @@ pub(crate) async fn release_device(
         .clone()
         .ok_or_else(|| ApiErrorReply(admin_surface_unavailable()))?;
     req.validate()?;
+    ops::require_consumer_operation_id(&req.operation_id)?;
     let device_id = parse_device_id(&device_id)?;
     tracing::info!(
         kind = ops::OP_RELEASE_DEVICE,
@@ -466,6 +480,7 @@ pub(crate) async fn lend_device(
         .clone()
         .ok_or_else(|| ApiErrorReply(lending_surface_unavailable()))?;
     req.validate()?;
+    ops::require_consumer_operation_id(&req.operation_id)?;
     let device_id = parse_device_id(&device_id)?;
     tracing::info!(
         kind = ops::OP_LEND_DEVICE,
@@ -507,6 +522,7 @@ pub(crate) async fn reclaim_device(
         .clone()
         .ok_or_else(|| ApiErrorReply(lending_surface_unavailable()))?;
     req.validate()?;
+    ops::require_consumer_operation_id(&req.operation_id)?;
     let device_id = parse_device_id(&device_id)?;
     tracing::info!(
         kind = ops::OP_RECLAIM_DEVICE,
@@ -545,6 +561,7 @@ pub(crate) async fn resolve_quarantine(
         .clone()
         .ok_or_else(|| ApiErrorReply(lending_surface_unavailable()))?;
     req.validate()?;
+    ops::require_consumer_operation_id(&req.operation_id)?;
     let device_id = parse_device_id(&device_id)?;
     tracing::info!(
         kind = ops::OP_RESOLVE_QUARANTINE,
@@ -609,6 +626,7 @@ pub(crate) async fn adopt_volume(
         .clone()
         .ok_or_else(|| ApiErrorReply(adoption_surface_unavailable()))?;
     req.validate()?;
+    ops::require_consumer_operation_id(&req.operation_id)?;
     let volume_id = parse_volume_id(&volume_id)?;
     tracing::info!(
         kind = ops::OP_ADOPT_VOLUME,
@@ -656,6 +674,7 @@ pub(crate) async fn clear_cut_marker(
         .clone()
         .ok_or_else(|| ApiErrorReply(handoff_surface_unavailable()))?;
     volvisor_types::validate_api_version(&req.api_version)?;
+    ops::require_consumer_operation_id(&req.operation_id)?;
     let volume_id = parse_volume_id(&volume_id)?;
     tracing::info!(
         kind = ops::OP_CLEAR_CUT_MARKER,
@@ -720,8 +739,9 @@ pub(crate) async fn check_mobility(
 /// migration record. Answers `201`; idempotent by `migration_id`
 /// (identical content re-serves the record, different content is the
 /// typed conflict). Journaled through the shared pipeline with a
-/// derived operation id (`mig-api-prepare-{16hex}`), so a retry after
-/// a lost response replays the recorded outcome byte-for-byte.
+/// derived operation id (`derived:mig-api-prepare-{16hex}`), so a
+/// retry after a lost response replays the recorded outcome
+/// byte-for-byte.
 pub(crate) async fn prepare_migration(
     State(state): State<SharedState>,
     _admin: RequireAdmin,

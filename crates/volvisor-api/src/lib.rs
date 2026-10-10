@@ -67,8 +67,9 @@
 //! without them serves the typed `404` (the `AdoptionSurface`
 //! discipline — the route exists uniformly, the deployment opted
 //! out). Their mutations journal through the same pipeline with
-//! **derived** operation ids (`mig-api-{tag}-{16hex}` over the
-//! migration id), so a post-crash retry replays the recorded outcome;
+//! **derived** operation ids (`derived:mig-api-{tag}-{16hex}` over the
+//! migration id, in the reserved namespace every consumer route
+//! refuses), so a post-crash retry replays the recorded outcome;
 //! the consumer routes keep the strict fail-closed in-doubt rule (the
 //! transfer's drive may be mid-flight), while the peer routes resolve
 //! an in-flight intent by inspection — the witness lease state, the

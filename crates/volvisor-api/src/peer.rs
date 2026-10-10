@@ -5,8 +5,10 @@
 //! calls over the daemon-to-daemon credential. Every mutation routes
 //! through the same journal pipeline as every other privileged act
 //! (`crate::ops::execute_resolvable`), with **derived** operation ids
-//! (`mig-api-{tag}-{16hex}` over the migration id) so a post-crash
-//! re-drive replays the recorded outcome instead of re-executing.
+//! (`derived:mig-api-{tag}-{16hex}` over the migration id, in the
+//! reserved namespace the consumer surface cannot reach) so a
+//! post-crash re-drive replays the recorded outcome instead of
+//! re-executing.
 //!
 //! ## The in-flight resolution rule (peer-route journaling)
 //!
@@ -1020,14 +1022,20 @@ pub struct PeerHealthResponse {
 // ---------------------------------------------------------------------------
 
 /// The deterministic identity string shared by the promote attach's
-/// `operation_id` and `attachment_id`: `mig-attach-{16hex}` over a
-/// domain-separated SHA-256 of the migration id and the volume id.
+/// `operation_id` and `attachment_id`:
+/// `derived:mig-attach-{16hex}` over a domain-separated SHA-256 of the
+/// migration id and the volume id, in the reserved
+/// [`crate::ops::DERIVED_ID_PREFIX`] namespace.
 ///
 /// One derivation for both namespaces (they never meet: the attach
 /// request's operation id lives in the provider's journal, the
 /// attachment id in the volume's attachment set) — and deterministic
 /// across re-drives so `promote_target`'s idempotent tail recognizes
-/// its own prior attachment.
+/// its own prior attachment. The reserved prefix keeps the identity
+/// unreachable from the consumer surface: the consumer attach route
+/// refuses prefixed attachment ids (the provider keys attach
+/// idempotency by attachment id, so a pre-claimed id would wedge the
+/// promote), and this internal path never passes that route.
 fn attach_identity(migration_id: &MigrationId, volume_id: &VolumeId) -> String {
     use sha2::Digest;
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -1037,7 +1045,8 @@ fn attach_identity(migration_id: &MigrationId, volume_id: &VolumeId) -> String {
     hasher.update(b":");
     hasher.update(volume_id.as_str().as_bytes());
     let digest = hasher.finalize();
-    let mut out = String::from("mig-attach-");
+    let mut out = String::from(crate::ops::DERIVED_ID_PREFIX);
+    out.push_str("mig-attach-");
     for byte in digest.iter().take(8) {
         out.push(HEX[usize::from(byte >> 4)] as char);
         out.push(HEX[usize::from(byte & 0x0f)] as char);

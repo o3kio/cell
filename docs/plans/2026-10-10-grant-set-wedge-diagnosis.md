@@ -146,3 +146,34 @@ Three properties the review asked to have named in this record:
   preparation). Idempotent semantics — the preparation is gone either
   way — and metadata-only: the divergence is in the advisory field,
   not in any state the caller acts on.
+
+## The operation-id namespace (the F5 follow-up, resolved)
+
+The review also pinned one defect beyond the wedge itself (F5, the
+readiness plan §1's recorded backlog): the derived act ids this
+document describes rendered `mig-api-{tag}-{16hex}` in the **same**
+journal namespace as consumer-supplied operation ids, and the
+derivation is deterministic from the consumer-chosen migration id —
+so an authenticated consumer could pre-register the id a migration's
+act would derive, with a differing payload, and wedge that act
+forever on the journal's `IDEMPOTENCY_CONFLICT` (DoS-class: nothing
+mutates on the conflict, but the act never lands either).
+
+**Resolved in PR #31** by namespacing the derivation, not the
+journal: every derived id renders in a reserved `derived:` prefix
+(`derived:mig-api-{tag}-{16hex}` for the acts, and
+`derived:mig-attach-{16hex}` for the promote attach identity, which
+doubles as the derived attachment id), and every consumer route that
+journals a consumer-supplied id refuses the prefix typed before any
+journal write — a refusal under a reserved id must leave no record,
+or the refusal itself would become the pre-claim. The derivation
+remains a pure function of the migration identity and act tag, so
+the re-issue machinery above is untouched: a post-crash re-drive
+re-derives the same id and replays the recorded outcome, and the
+healed-wedge rows run green at the fix's head. The example ids in
+this document (`mig-api-peer-grant-…`) therefore read
+`derived:mig-api-peer-grant-…` on any daemon at or past PR #31. No
+deployed journal predates PR #31 (the project is pre-production —
+ADR-0003 makes no deployed API compatibility claim), so this one-way
+rendering owes no replay migration; the note exists for a future
+reader comparing this document's examples against real journals.
