@@ -172,4 +172,8 @@ the re-issue machinery above is untouched: a post-crash re-drive
 re-derives the same id and replays the recorded outcome, and the
 healed-wedge rows run green at the fix's head. The example ids in
 this document (`mig-api-peer-grant-…`) therefore read
-`derived:mig-api-peer-grant-…` on any daemon at or past PR #31.
+`derived:mig-api-peer-grant-…` on any daemon at or past PR #31. No
+deployed journal predates PR #31 (the project is pre-production —
+ADR-0003 makes no deployed API compatibility claim), so this one-way
+rendering owes no replay migration; the note exists for a future
+reader comparing this document's examples against real journals.

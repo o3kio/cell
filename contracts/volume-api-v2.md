@@ -224,7 +224,7 @@ Common errors:
 `MOVE_UNSUPPORTED_SCOPE`, `VMM_HANDOFF_UNSUPPORTED`, `OPERATION_IN_DOUBT`,
 `UNSAFE_DATA_LOSS`, `CEPH_CLUSTER_UNHEALTHY`.
 
-Mutations are idempotent by `operation_id` + exact immutable request hash. Reuse with different payload is conflict. Must be replay-safe after journaled intent, operation and response persistence; unknown commit outcome is an observable retriable state, not implicit retry with a new ID. Operation ids and attachment ids carrying the reserved `derived:` prefix are refused typed before any journal write: the prefix is the engine's derived-identity namespace, unreachable from the consumer surface.
+Mutations are idempotent by `operation_id` + exact immutable request hash. Reuse with different payload is conflict. Must be replay-safe after journaled intent, operation and response persistence; unknown commit outcome is an observable retriable state, not implicit retry with a new ID. Operation ids and attachment ids carrying the reserved `derived:` prefix are refused typed before any journal write: the prefix is the engine's derived-identity namespace, unreachable from the consumer surface. The refusal is enforced at the routes whose surfaces key on these ids (operation ids on every mutating route; attachment ids on the attach route, whose provider keys attach idempotency by attachment id); other acceptors of an attachment id (the detach route's lookup key) fail closed at the provider.
 
 ## 8. Backend extension and security
 
