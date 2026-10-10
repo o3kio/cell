@@ -94,7 +94,16 @@ always carry one version. Examples:
 
 ## The release process
 
-1. A maintainer pushes a **signed** `v*` git tag.
+1. A maintainer pushes a **signed** `v*` git tag. **Release tags are
+   `v<semver>`** (e.g. `v0.1.0`) — digits and dots, no hyphens. The
+   shape is enforced, not just documented: `package-version.sh`
+   refuses a hyphen-bearing tag outright (a pre-release like
+   `v0.1.0-rc1` would sanitize to `0.1.0+rc1`, which sorts *after*
+   the release — the wrong order), and the release workflow's
+   `guard` job fails any ref whose mapped version does not lead with
+   a digit (a `vtest` tag stops there, before any build or publish
+   attempt). Pre-release tags are outside this pipeline's
+   convention.
 2. `.github/workflows/release.yaml` runs: the full gate set (fmt,
    clippy on both feature sets, workspace tests, cargo doc, the
    real-LVM integration suite) and the **campaign certification**
