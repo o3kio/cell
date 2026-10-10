@@ -578,6 +578,331 @@ async fn grow_composes_the_notifier_status_inside_the_journaled_outcome() {
 }
 
 // ---------------------------------------------------------------------------
+// The reserved operation-id namespace (F5 of PR #23's review): derived
+// ids and consumer ids share the journal's id space, so the derived ids
+// render in a reserved `derived:` prefix every consumer route refuses —
+// a crafted pre-claim of a would-be derived id can never land, and the
+// migration's own act can never be wedged by `IDEMPOTENCY_CONFLICT`.
+// ---------------------------------------------------------------------------
+
+/// State with every consumer route's surface wired (volume ops, admin
+/// claim/release, lending, adoption, clear-cut-marker) — the table
+/// test needs all thirteen consumer-supplied-id routes reachable.
+fn setup_all_consumer_surfaces() -> (SharedState, Arc<FakeProvider>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let journal = Journal::open(dir.path()).expect("journal open");
+    let provider = Arc::new(FakeProvider::new());
+    let admin: Arc<dyn volvisor_provider::AdminSurface> = provider.clone();
+    let lending: Arc<dyn volvisor_provider::LendingSurface> = provider.clone();
+    let adoption = Arc::new(FakeAdoption::new());
+    let handoff = Arc::new(FakeHandoffSurface::new());
+    let state = Arc::new(
+        AppState::new(
+            provider.clone(),
+            Some(admin),
+            journal,
+            Some(TEST_TOKEN.to_owned()),
+        )
+        .with_lending(lending)
+        .with_adoption(adoption)
+        .with_handoff(handoff),
+    );
+    (state, provider, dir)
+}
+
+/// The derivation is a pure function of the migration identity and the
+/// act tag, and every derived id carries the reserved prefix — the
+/// direction that makes the namespace unreachable, not just guarded.
+#[test]
+fn derived_operation_ids_render_in_the_reserved_namespace() {
+    let tags = [
+        "prepare",
+        "transfer",
+        "abort",
+        "peer-prepare",
+        "peer-grant",
+        "peer-restore-vm",
+        "peer-discard",
+    ];
+    for tag in tags {
+        let id = ops::mobility_operation_id(&migration_id("mig-ns"), tag).expect("derived op id");
+        let raw = id.as_str();
+        assert!(raw.starts_with("derived:"), "reserved prefix: {raw}");
+        assert!(raw.starts_with("derived:mig-api-"), "shaped body: {raw}");
+        assert!(ops::is_derived_id(raw));
+        // Determinism: the same inputs re-derive the same id — the
+        // re-issue machinery's premise (a post-crash re-drive replays
+        // the recorded outcome under the same id).
+        let again = ops::mobility_operation_id(&migration_id("mig-ns"), tag).expect("re-derive");
+        assert_eq!(again, id, "the derivation is pure");
+    }
+    // Different inputs derive different ids (a `prepare` and a
+    // `transfer` of one migration are different operations).
+    let prepare =
+        ops::mobility_operation_id(&migration_id("mig-ns"), "prepare").expect("prepare id");
+    let transfer =
+        ops::mobility_operation_id(&migration_id("mig-ns"), "transfer").expect("transfer id");
+    let other_migration = ops::mobility_operation_id(&migration_id("mig-other"), "prepare")
+        .expect("other migration id");
+    assert_ne!(prepare, transfer);
+    assert_ne!(prepare, other_migration);
+    // Ordinary consumer ids are not in the reserved namespace.
+    assert!(!ops::is_derived_id("op-1"));
+    assert!(!ops::is_derived_id("mig-api-prepare-deadbeefdeadbeef"));
+}
+
+/// Every consumer route that journals a consumer-supplied operation id
+/// refuses a reserved-prefixed id typed, before any journal write —
+/// and a later legitimate operation is not blocked by the refusal.
+#[tokio::test]
+async fn consumer_routes_refuse_reserved_operation_ids() {
+    let (state, _provider, _dir) = setup_all_consumer_surfaces();
+    let app = app(&state);
+    let evil =
+        ops::mobility_operation_id(&migration_id("mig-ns"), "peer-grant").expect("derived op id");
+    assert!(ops::is_derived_id(evil.as_str()));
+
+    // (uri, body) per consumer route, each body shape-valid so the
+    // reserved-namespace guard is what fires — not request validation.
+    let mut create =
+        serde_json::to_value(fixture_create_request("vol-ns", GIB)).expect("create fixture");
+    create["operation_id"] = json!(evil.as_str());
+    let mut attach = serde_json::to_value(fixture_attach_request("vol-ns", "att-ns", 1))
+        .expect("attach fixture");
+    attach["operation_id"] = json!(evil.as_str());
+    let mut detach =
+        serde_json::to_value(fixture_detach_request("att-ns", 1)).expect("detach fixture");
+    detach["operation_id"] = json!(evil.as_str());
+    detach["attachment_id"] = json!("att-ns");
+    let mut grow =
+        serde_json::to_value(fixture_grow_request("vol-ns", 2 * GIB, 1)).expect("grow fixture");
+    grow["operation_id"] = json!(evil.as_str());
+
+    let routes: Vec<(Method, String, Value)> = vec![
+        (Method::POST, "/v2/volumes".to_owned(), create),
+        (Method::POST, "/v2/volumes/vol-ns/attach".to_owned(), attach),
+        (Method::POST, "/v2/volumes/vol-ns/detach".to_owned(), detach),
+        (Method::POST, "/v2/volumes/vol-ns/grow".to_owned(), grow),
+        (
+            Method::POST,
+            "/v2/volumes/vol-ns/move-backing".to_owned(),
+            move_request(evil.as_str(), "/dev/disk/by-id/wwn-0x5000c500target01", 1),
+        ),
+        (
+            Method::DELETE,
+            "/v2/volumes/vol-ns".to_owned(),
+            serde_json::to_value(fixture_delete_request("vol-ns", 1)).expect("delete fixture"),
+        ),
+        (
+            Method::POST,
+            format!("/v2/admin/devices/{FAKE_DEVICE}/claim"),
+            admin_request(evil.as_str(), "scoped"),
+        ),
+        (
+            Method::POST,
+            format!("/v2/admin/devices/{FAKE_DEVICE}/release"),
+            admin_request(evil.as_str(), "scoped"),
+        ),
+        (
+            Method::POST,
+            format!("/v2/admin/devices/{FAKE_DEVICE}/lend"),
+            json!({
+                "api_version": "volvisor.volume.v2",
+                "operation_id": evil.as_str(),
+                "borrower_cell_id": "cell-ns",
+                "expected_claim_generation": 1,
+            }),
+        ),
+        (
+            Method::POST,
+            format!("/v2/admin/devices/{FAKE_DEVICE}/reclaim"),
+            json!({
+                "api_version": "volvisor.volume.v2",
+                "operation_id": evil.as_str(),
+                "expected_lend_generation": 1,
+                "force": null,
+            }),
+        ),
+        (
+            Method::POST,
+            format!("/v2/admin/devices/{FAKE_DEVICE}/resolve-quarantine"),
+            json!({
+                "api_version": "volvisor.volume.v2",
+                "operation_id": evil.as_str(),
+                "operator_authorization": "operator-token",
+            }),
+        ),
+        (
+            Method::POST,
+            "/v2/admin/nearline/vol-ns/adopt".to_owned(),
+            adopt_body(evil.as_str(), false),
+        ),
+        (
+            Method::POST,
+            "/v2/admin/nearline/vol-ns/clear-cut-marker".to_owned(),
+            clear_cut_body(evil.as_str()),
+        ),
+    ];
+    for (method, uri, mut body) in routes {
+        // The delete fixture has no operation_id field of its own to
+        // override per-route; set it uniformly here.
+        body["operation_id"] = json!(evil.as_str());
+        let (status, refused) = send_json(&app, json_request(method, &uri, &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {refused}");
+        assert_eq!(refused["code"], json!("INVALID_REQUEST"), "{uri}");
+        let message = refused["message"].as_str().unwrap_or_default();
+        assert!(message.contains("reserved namespace"), "{uri}: {message}");
+        assert!(message.contains("derived:"), "{uri}: {message}");
+        // Nothing was journaled under the reserved id — the refusal
+        // is pre-pipeline, so it cannot become the pre-claim record
+        // the wedge needed.
+        assert!(
+            state
+                .journal
+                .lock()
+                .expect("journal lock")
+                .lookup(&evil)
+                .is_none(),
+            "{uri}: the refusal wrote nothing"
+        );
+    }
+
+    // The attach route refuses a reserved attachment id too (the
+    // promote attach's derived attachment identity lives in the
+    // namespace; the provider keys attach idempotency by it).
+    let mut attach_identity = serde_json::to_value(fixture_attach_request("vol-ns", "att-ns", 1))
+        .expect("attach fixture");
+    attach_identity["operation_id"] = json!("op-attach-ns");
+    attach_identity["attachment_id"] = json!("derived:mig-attach-0123456789abcdef");
+    let (status, refused) = send_json(
+        &app,
+        json_request(Method::POST, "/v2/volumes/vol-ns/attach", &attach_identity),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "attach identity: {refused}"
+    );
+    assert_eq!(refused["code"], json!("INVALID_REQUEST"));
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reserved namespace"),
+        "{refused}"
+    );
+
+    // A later legitimate operation sails through: nothing the
+    // refusals did blocks the surface.
+    let (status, created) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes",
+            &serde_json::to_value(fixture_create_request("vol-after-ns", GIB))
+                .expect("create fixture"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "legitimate op after refusals: {created}"
+    );
+    assert_eq!(created["volume_id"], json!("vol-after-ns"));
+}
+
+/// The finding's exact repro, fixed: a consumer crafts the id a
+/// migration's peer act will derive and tries to pre-register it with
+/// a differing payload. The pre-claim cannot land (typed refusal,
+/// nothing journaled), and the peer act itself succeeds — no
+/// `IDEMPOTENCY_CONFLICT` is reachable.
+#[tokio::test]
+async fn a_crafted_pre_claim_cannot_wedge_a_peer_act() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+
+    // The derived id of this migration's peer-grant act — exactly the
+    // string an authenticated consumer would craft (the derivation is
+    // deterministic from the consumer-chosen migration id).
+    let evil =
+        ops::mobility_operation_id(&migration_id("mig-f5"), "peer-grant").expect("derived op id");
+    assert!(ops::is_derived_id(evil.as_str()));
+
+    // The pre-claim attempt: a consumer op under the derived id is
+    // refused typed before any journal write.
+    let mut crafted =
+        serde_json::to_value(fixture_create_request("vol-f5-claim", GIB)).expect("create fixture");
+    crafted["operation_id"] = json!(evil.as_str());
+    let (status, refused) =
+        send_json(&app, json_request(Method::POST, "/v2/volumes", &crafted)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["code"], json!("INVALID_REQUEST"));
+    assert!(
+        kit.state
+            .journal
+            .lock()
+            .expect("journal lock")
+            .lookup(&evil)
+            .is_none()
+    );
+
+    // The unprefixed twin is an ordinary consumer id: journaling it
+    // proves the separation is the prefix, not the body — a consumer
+    // id that merely looks like the derived body cannot collide.
+    let twin = evil
+        .as_str()
+        .strip_prefix(ops::DERIVED_ID_PREFIX)
+        .expect("the derived id carries the prefix");
+    let mut twin_body =
+        serde_json::to_value(fixture_create_request("vol-f5-twin", GIB)).expect("create fixture");
+    twin_body["operation_id"] = json!(twin);
+    let (status, created) =
+        send_json(&app, json_request(Method::POST, "/v2/volumes", &twin_body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the unprefixed twin is a consumer id: {created}"
+    );
+    assert_eq!(created["volume_id"], json!("vol-f5-twin"));
+
+    // The peer act under its derived id succeeds — prepare, then the
+    // grant that the pre-claim tried to wedge.
+    create_volume(&kit, "vol-f5").await;
+    let (status, _body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-f5", "vm-f5", &[("vol-f5", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-f5"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the peer act is unwedgeable: {body}"
+    );
+    assert_eq!(body["migration_id"], json!("mig-f5"));
+    assert_eq!(body["grants"][0]["volume_id"], json!("vol-f5"));
+    assert_eq!(
+        body["grants"][0]["device_path"],
+        json!("/dev/drbd-by-res/vol-f5")
+    );
+}
+
+// ---------------------------------------------------------------------------
 // MoveVolumeBackingOnline (contract section 4A): the route layer over the
 // fail-closed trait default. The FakeProvider does not advertise
 // `same_vg_extent_move`, so these pin the unqualified-provider refusal and
@@ -3618,7 +3943,12 @@ async fn peer_grant_grants_promotes_and_answers_device_paths() {
         // string (distinct namespaces, one derivation), in the
         // reserved namespace the consumer attach route refuses.
         assert_eq!(attach.operation_id.as_str(), attach.attachment_id.as_str());
-        assert!(attach.operation_id.as_str().starts_with("derived:mig-attach-"));
+        assert!(
+            attach
+                .operation_id
+                .as_str()
+                .starts_with("derived:mig-attach-")
+        );
         assert!(matches!(volume.as_str(), "vol-g1" | "vol-g2"));
     }
 
