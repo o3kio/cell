@@ -3615,9 +3615,10 @@ async fn peer_grant_grants_promotes_and_answers_device_paths() {
         assert_eq!(attach.host_id, kit.host);
         // The deterministic per-(migration, volume) attach identity:
         // the operation id and the attachment id are the same derived
-        // string (distinct namespaces, one derivation).
+        // string (distinct namespaces, one derivation), in the
+        // reserved namespace the consumer attach route refuses.
         assert_eq!(attach.operation_id.as_str(), attach.attachment_id.as_str());
-        assert!(attach.operation_id.as_str().starts_with("mig-attach-"));
+        assert!(attach.operation_id.as_str().starts_with("derived:mig-attach-"));
         assert!(matches!(volume.as_str(), "vol-g1" | "vol-g2"));
     }
 

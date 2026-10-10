@@ -880,15 +880,94 @@ pub(crate) fn move_hash(req: &MoveVolumeBackingRequest, volume_id: &VolumeId) ->
 // remembered a random id. The derivation mirrors
 // `volvisor_handoff::batch_operation_id`'s discipline —
 // domain-separated SHA-256 over the migration identity and a route
-// tag, rendered `mig-api-{tag}-{16 hex}` — and the request hash folds
-// the same tag into its domain so two acts of one migration can never
-// collide in the journal (a `prepare` and a `transfer` of the same
-// migration are different operations even though both key on the
-// migration id).
+// tag — and the request hash folds the same tag into its domain so
+// two acts of one migration can never collide in the journal (a
+// `prepare` and a `transfer` of the same migration are different
+// operations even though both key on the migration id).
+//
+// The rendered ids live in the **reserved namespace** below: derived
+// ids and consumer-supplied ids share the journal's id space, and the
+// derivation is deterministic from caller-known inputs, so before the
+// namespace existed an authenticated consumer could pre-register a
+// crafted id equal to a migration's derived act id and wedge that act
+// forever with `IDEMPOTENCY_CONFLICT` (DoS-class — the F5 finding of
+// PR #23's review, pinned in the readiness plan §1).
+
+/// The reserved namespace marker every engine-derived identity
+/// carries: `derived:`.
+///
+/// The journal's id space is shared between consumer-supplied
+/// `operation_id`s and ids the engine derives for its own acts
+/// (mobility stages, peer routes, the promote attach identity) — and
+/// those derivations are deterministic from inputs a caller knows
+/// (the migration id is consumer-chosen), so a consumer could craft
+/// the id a future act will derive and pre-register it with a
+/// differing payload. The namespaces are now disjoint by
+/// construction, in both directions: every derived id carries this
+/// prefix, and every consumer-supplied id carrying it is refused
+/// typed at the route boundary ([`require_consumer_operation_id`],
+/// [`require_consumer_attachment_id`]) **before any journal write** —
+/// a refusal under a reserved id must leave no record, or the refusal
+/// itself would become the pre-claim it exists to prevent. The guard
+/// lives at the route boundary, not in the shared request
+/// validation, because internal paths legitimately carry derived ids
+/// through consumer-shaped request types (the promote attach reuses
+/// [`AttachVolumeRequest`]).
+pub(crate) const DERIVED_ID_PREFIX: &str = "derived:";
+
+/// Whether an identity string lives in the engine-derived reserved
+/// namespace ([`DERIVED_ID_PREFIX`]).
+pub(crate) fn is_derived_id(raw: &str) -> bool {
+    raw.starts_with(DERIVED_ID_PREFIX)
+}
+
+/// Refuse a consumer-supplied `operation_id` that carries the reserved
+/// [`DERIVED_ID_PREFIX`].
+///
+/// Called by every consumer route that journals a consumer-supplied
+/// id, right after the request's shape validation and before the
+/// pipeline's intent append — the refusal is `INVALID_REQUEST`
+/// (a well-formed id that is not acceptable on the consumer surface,
+/// exactly like a charset violation) and journals nothing.
+///
+/// # Errors
+/// [`ApiErrorCode::InvalidRequest`] naming the reserved namespace when
+/// the id carries [`DERIVED_ID_PREFIX`].
+pub(crate) fn require_consumer_operation_id(id: &OperationId) -> Result<(), ApiError> {
+    if is_derived_id(id.as_str()) {
+        return Err(ApiError::invalid_request(format!(
+            "operation_id uses the reserved namespace '{DERIVED_ID_PREFIX}' \
+             (engine-derived operation ids); supply a consumer id without it"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a consumer-supplied `attachment_id` that carries the reserved
+/// [`DERIVED_ID_PREFIX`]: the promote attach's deterministic attachment
+/// identity lives in that namespace (`crate::peer`'s `attach_identity`),
+/// and the provider keys attach idempotency by attachment id — a
+/// pre-claimed prefixed attachment id would wedge the promote exactly
+/// the way a pre-claimed operation id wedges a journaled act.
+///
+/// # Errors
+/// [`ApiErrorCode::InvalidRequest`] naming the reserved namespace when
+/// the id carries [`DERIVED_ID_PREFIX`].
+pub(crate) fn require_consumer_attachment_id(id: &AttachmentId) -> Result<(), ApiError> {
+    if is_derived_id(id.as_str()) {
+        return Err(ApiError::invalid_request(format!(
+            "attachment_id uses the reserved namespace '{DERIVED_ID_PREFIX}' \
+             (engine-derived identities); supply a consumer id without it"
+        )));
+    }
+    Ok(())
+}
 
 /// Derive the deterministic journal operation id for one mobility or
-/// peer-route act of one migration: `mig-api-{tag}-{16 hex}` over a
-/// domain-separated SHA-256 of the migration id and the route tag.
+/// peer-route act of one migration:
+/// `derived:mig-api-{tag}-{16 hex}` over a domain-separated SHA-256 of
+/// the migration id and the route tag, in the reserved
+/// [`DERIVED_ID_PREFIX`] namespace the consumer surface cannot reach.
 ///
 /// `tag` must be non-empty and use the identity charset (the fixed
 /// route tags are; a caller-supplied tag is validated by
@@ -907,7 +986,7 @@ pub(crate) fn mobility_operation_id(
     hasher.update(b":");
     hasher.update(tag.as_bytes());
     let digest = hasher.finalize();
-    let raw = format!("mig-api-{tag}-{}", hex16(&digest));
+    let raw = format!("{DERIVED_ID_PREFIX}mig-api-{tag}-{}", hex16(&digest));
     OperationId::new(raw).map_err(|error| {
         ApiError::new(
             ApiErrorCode::Internal,
