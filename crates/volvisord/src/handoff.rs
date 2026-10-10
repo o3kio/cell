@@ -1294,7 +1294,8 @@ enum DriveTaskSlot {
     /// The task finished before its handle was recorded — the record
     /// step drops the handle instead of tracking a dead task.
     FinishedEarly,
-    /// The kill group fired while the slot was still [`Starting`]
+    /// The kill group fired while the slot was still
+    /// [`DriveTaskSlot::Starting`]
     /// (P5 plan §3.3: the group must be COMPLETE — a drive between
     /// spawn and record is a mutation engine the kill missed). The
     /// handle is not abortable yet, so the record step aborts it the
@@ -1317,7 +1318,8 @@ struct DriveTaskRegistry {
 }
 
 impl DriveTaskRegistry {
-    /// Allocate the next task id (the slot starts [`Starting`]: the
+    /// Allocate the next task id (the slot starts
+    /// [`DriveTaskSlot::Starting`]: the
     /// spawner records the handle right after `tokio::spawn`).
     fn alloc(&mut self) -> u64 {
         self.next_id += 1;
@@ -1374,8 +1376,9 @@ impl DriveTaskRegistry {
 
     /// Take every recorded handle out (the abort path's first half —
     /// an aborted task cannot run its final act, so the registry must
-    /// reap it wholesale). A slot still [`Starting`] (the spawner
-    /// between spawn and record) is marked [`AbortPending`] — the
+    /// reap it wholesale). A slot still [`DriveTaskSlot::Starting`]
+    /// (the spawner between spawn and record) is marked
+    /// [`DriveTaskSlot::AbortPending`] — the
     /// group is complete only if this window is covered too.
     fn take_live(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
         let ids: Vec<u64> = self.slots.keys().copied().collect();

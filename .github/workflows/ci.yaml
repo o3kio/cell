@@ -7,6 +7,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # RUSTFLAGS does not reach rustdoc; the doc gate needs its own
+  # denial flag or pre-existing rustdoc warnings rot silently
+  # (review NIT-3).
+  RUSTDOCFLAGS: -D warnings
 
 jobs:
   check:
@@ -18,9 +22,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo doc --no-deps --document-private-items
+      - run: cargo clippy --workspace --locked --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo doc --locked --no-deps --document-private-items
 
   lvm-integration:
     runs-on: ubuntu-latest
@@ -31,7 +35,7 @@ jobs:
       - name: Install LVM2
         run: sudo apt-get update && sudo apt-get install -y lvm2
       - name: Run LVM-gated integration tests
-        run: sudo -E env "PATH=$PATH" VOLVISOR_TEST_LVM=1 cargo test -p volvisor-lvm --features integration-lvm
+        run: sudo -E env "PATH=$PATH" VOLVISOR_TEST_LVM=1 cargo test --locked -p volvisor-lvm --features integration-lvm
 
   msrv:
     runs-on: ubuntu-latest
@@ -45,7 +49,7 @@ jobs:
       # minimum) against the committed lockfile. If a dependency drifts to a
       # version needing a newer compiler, this job fails and the dep must be
       # pinned back or the MSRV claim raised deliberately.
-      - run: cargo check --workspace --all-targets
+      - run: cargo check --workspace --locked --all-targets
 
   supply-chain:
     runs-on: ubuntu-latest
@@ -57,3 +61,71 @@ jobs:
       # DB format (0.18.5 fails on 2026-10 advisories).
       - run: cargo install cargo-deny --locked --version 0.20.2
       - run: cargo deny check
+
+  # The packaging gate (P7-C): build the .deb and .rpm exactly as the
+  # release pipeline builds them, then smoke both in stock distro
+  # containers, so packaging regressions surface per change instead of
+  # at release time. These two jobs deliberately duplicate the build
+  # and smoke jobs of .github/workflows/release.yaml — the release
+  # workflow's header explains why duplication beats a fragile
+  # composite here. No release is created or implied.
+  package-build:
+    runs-on: ubuntu-latest
+    outputs:
+      describe: ${{ steps.stamp.outputs.describe }}
+      version: ${{ steps.stamp.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p volvisord --bins
+      - name: Assert the binary stamp and derive the package version
+        id: stamp
+        run: |
+          set -eu
+          describe=$(git describe --tags --always --dirty)
+          test "$(./target/release/volvisord --version)" = "volvisord $describe"
+          test "$(./target/release/volvisor-witnessd --version)" = "volvisor-witnessd $describe"
+          version=$(./packaging/package-version.sh)
+          echo "describe=$describe" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Cache the packaging tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: packaging-tools-${{ runner.os }}-cargo-deb-3.8.0-cargo-generate-rpm-0.21.0
+      # Pinned for reproducible packaging; bump deliberately (the
+      # cache key above carries the same versions).
+      - name: Install the packaging tools
+        run: |
+          command -v cargo-deb >/dev/null 2>&1 || cargo install --locked --version 3.8.0 cargo-deb
+          command -v cargo-generate-rpm >/dev/null 2>&1 || cargo install --locked --version 0.21.0 cargo-generate-rpm
+      - run: cargo deb -p volvisord --deb-version "${{ steps.stamp.outputs.version }}" --output "dist/volvisor_${{ steps.stamp.outputs.version }}_amd64.deb"
+      - run: cargo generate-rpm -p crates/volvisord -s 'version = "${{ steps.stamp.outputs.version }}"' -o dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-packages
+          path: dist/
+
+  package-smoke:
+    needs: package-build
+    strategy:
+      fail-fast: false
+      matrix:
+        container: ["debian:stable", "fedora:latest"]
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
+    env:
+      DESCRIBE: ${{ needs.package-build.outputs.describe }}
+      VERSION: ${{ needs.package-build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-packages
+          path: dist
+      - name: Install and smoke the package
+        working-directory: dist
+        run: sh ../packaging/smoke.sh "$DESCRIBE" "$VERSION"

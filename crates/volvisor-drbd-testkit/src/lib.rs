@@ -1141,12 +1141,12 @@ fn minor_of_spec(spec: &str) -> Option<u32> {
 /// shared_tool.c:631-674): a bare decimal or `/dev/drbd<minor>`;
 /// anything else — a bare resource name, `all` (refused outright for
 /// a CTX_MINOR-only command, drbdsetup.c:4691-4693) — fails with
-/// "Cannot determine minor device number of device '<arg>'"
+/// `Cannot determine minor device number of device '<arg>'`
 /// (drbdsetup.c:4697-4701, exit 20).
 ///
 /// A minor with no running resource answers through the netlink
 /// error surface of `_generic_config_cmd` → `check_error`:
-/// "<obj>: Failure: (<code>) <message>" (drbdsetup.c:988-991, exit
+/// `<obj>: Failure: (<code>) <message>` (drbdsetup.c:988-991, exit
 /// 10) with ERR_MINOR_INVALID = 127 "Device minor not allocated"
 /// (drbdsetup.c:512, code from user/v84/linux/drbd.h:137).
 /// ASSUMPTION(unverified): which code the KERNEL picks for an
@@ -1231,7 +1231,7 @@ fn script_drbdsetup_suspend_io(
 ///
 /// `show_or_get_gi_cmd` (drbdsetup.c:4146-4203) walks the KERNEL's
 /// peer devices, so a resource that is not up answers
-/// "<resource>: No such peer device" (4164-4165, exit 10) — same for
+/// `<resource>: No such peer device` (4164-4165, exit 10) — same for
 /// a peer-node-id/volume that matches no peer device
 /// (peer_device_ctx_match, 4138-4144). An up resource whose local
 /// disk is detached answers "Device has no disk" (4179-4185, exit 1;
