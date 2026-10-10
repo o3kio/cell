@@ -39,8 +39,8 @@ use volvisor_drbd::AuthorityContext;
 use volvisor_drbd::provider::{DrbdProvider, DrbdProviderConfig, resource_name_for};
 use volvisor_drbd::report::Role;
 use volvisor_drbd_testkit::{
-    FakeDrbd, NODE, PEER_NODE, SEED_MINOR, SEED_PORT, config_for, config_for_peer, fixture,
-    leak_tempdir, link_replication_peers, seed_peer_volume, seed_volume_with_identity,
+    FakeDrbd, Fixture, NODE, PEER_NODE, SEED_MINOR, SEED_PORT, config_for, config_for_peer,
+    fixture, leak_tempdir, link_replication_peers, seed_peer_volume, seed_volume_with_identity,
 };
 use volvisor_handoff::Clock;
 use volvisor_journal::Journal;
@@ -534,6 +534,15 @@ pub struct DaemonCore {
     pub provider_config: DrbdProviderConfig,
     /// This host's fake VMM.
     pub vmm: Arc<FakeVmm>,
+    /// The VMM controller the DAEMON drives (the Tier V seam,
+    /// ADR-0010): `None` — the default, every Tier S row — serves the
+    /// wired fake view above as the controller. `Some(..)` swaps in a
+    /// real controller (a mirrored `ChRemoteVmm` over a live
+    /// cloud-hypervisor process) while the fake view stays the rig's
+    /// observation/writer model — the mirror keeps the two coherent,
+    /// so the device model below the seam follows the real VMM's
+    /// acts instead of diverging from them.
+    pub vmm_controller: Option<Arc<dyn VmmController>>,
     /// The OTHER daemon's address (the peer client's target).
     pub peer_addr: SocketAddr,
     /// The witness's address (the connection and probe target).
@@ -712,11 +721,21 @@ impl Daemon {
                 facts_provider.migration_participant_facts(volume_id, vm_id, expected_generation)
             },
         );
+        // The VMM controller the daemon drives: the wired fake view
+        // (every Tier S row) or the Tier V override — a real,
+        // mirrored controller over a live cloud-hypervisor process
+        // (ADR-0010). The override resolves exactly here, once per
+        // launch, so a restart (the kill rows' recovery) reuses the
+        // same controller the killed incarnation drove.
+        let vmm: Arc<dyn VmmController> = core.vmm_controller.clone().unwrap_or_else(|| {
+            let view: Arc<FakeVmm> = Arc::clone(&core.vmm);
+            view as Arc<dyn VmmController>
+        });
         let (handle, peer_ctx) = wire_migration(
             HostId::new(core.name.as_str()).expect("valid host id"),
             witness,
             core.witness_addr,
-            Arc::clone(&core.vmm) as Arc<dyn VmmController>,
+            vmm,
             Arc::clone(&provider) as Arc<dyn HandoffSurface>,
             Arc::clone(&provider) as Arc<dyn VolumeProvider>,
             Arc::new(peer) as Arc<dyn PeerClient>,
@@ -1076,6 +1095,7 @@ fn rig_daemon_core(
     journal_dir: PathBuf,
     provider_config: DrbdProviderConfig,
     vmm: &Arc<FakeVmm>,
+    vmm_controller: Option<Arc<dyn VmmController>>,
     peer_addr: SocketAddr,
     witness_addr: SocketAddr,
     stamp_clock: &Arc<AtomicU64>,
@@ -1090,6 +1110,7 @@ fn rig_daemon_core(
         journal_dir,
         provider_config,
         vmm: Arc::clone(vmm),
+        vmm_controller,
         peer_addr,
         witness_addr,
         clock: clock_of(stamp_clock),
@@ -1101,6 +1122,21 @@ fn rig_daemon_core(
         killed: Arc::new(AtomicBool::new(false)),
     })
 }
+
+/// The Tier V controller factory (ADR-0010): receives the rig's two
+/// wired fake views (source, destination) and returns the controller
+/// each daemon will drive instead. The Tier V substrate passes a
+/// factory that wraps each view in a [`crate::tier_v::MirroredVmm`]
+/// — a real `ChRemoteVmm` over a live cloud-hypervisor process that
+/// mirrors its observed state transitions into the view, so the
+/// rig's writer model and the fake worlds' device model stay
+/// coherent with the real VMM's acts. The factory runs at rig
+/// construction, before either daemon launches.
+pub type VmmControllerFactory = Arc<
+    dyn Fn(Arc<FakeVmm>, Arc<FakeVmm>) -> (Arc<dyn VmmController>, Arc<dyn VmmController>)
+        + Send
+        + Sync,
+>;
 
 /// Build the full campaign fixture for one VM and N volumes (§9
 /// row 12's multi-volume cut): witness, both worlds (every volume
@@ -1114,19 +1150,35 @@ fn rig_daemon_core(
 /// `SEED_MINOR + i` / `SEED_PORT + i` (the fixture's allocation
 /// ranges hold ten volumes; more than that is a rig bug).
 pub async fn campaign_rig_volumes(vm: &str, volume_ids: &[&str]) -> Rig {
-    install_panic_filter();
-    assert!(
-        !volume_ids.is_empty(),
-        "a campaign rig needs at least one volume"
-    );
-    let volume_ids: Vec<String> = volume_ids.iter().map(ToString::to_string).collect();
-    let clock = Arc::new(AtomicU64::new(START));
-    // The stamp clock (S1): the writer's per-ack ticks and the
-    // coordinator's stamps share it; the lease clock above stays
-    // untouched by guest I/O.
-    let stamp_clock = Arc::new(AtomicU64::new(START));
-    let witness = WitnessHandle::spawn(Arc::clone(&clock)).await;
+    campaign_rig_volumes_inner(vm, volume_ids, None).await
+}
 
+/// The Tier V entry ([`campaign_rig_volumes`] with a real VMM): the
+/// same fixture — witness, linked worlds, providers, register/
+/// attach/VM seeding, both daemons — composed so each daemon's
+/// migration coordinator drives the CONTROLLER the factory builds
+/// instead of its fake view. Everything below the VMM seam stays
+/// simulated (ADR-0010's explicit allowance); the caller owns the
+/// real processes the controllers talk to (see
+/// [`crate::tier_v::RealVmmRig`]) and must outlive the rig.
+pub async fn campaign_rig_volumes_with_vmm(
+    vm: &str,
+    volume_ids: &[&str],
+    factory: VmmControllerFactory,
+) -> Rig {
+    campaign_rig_volumes_inner(vm, volume_ids, Some(factory)).await
+}
+
+/// The rig's seeded storage fixture: the source/target fixture pair
+/// with every volume identity-seeded on the source and peer-seeded
+/// on the destination (BEFORE the providers construct — providers
+/// load state at construction), and the two worlds LINKED so queue
+/// drains and resyncs really move content (§2.1). The `i`-th
+/// volume's device identity is `SEED_MINOR + i` / `SEED_PORT + i`
+/// (the fixture's allocation ranges hold ten volumes; more than
+/// that is a rig bug). Returns the fixtures and the destination's
+/// durable state path.
+fn seeded_fixture(volume_ids: &[String]) -> (Fixture, Fixture, PathBuf) {
     let source = fixture();
     let target = fixture();
     let target_state = target.base.join("state-peer.json");
@@ -1155,10 +1207,45 @@ pub async fn campaign_rig_volumes(vm: &str, volume_ids: &[&str]) -> Rig {
         );
     }
     link_replication_peers(&source.world, &target.world);
+    (source, target, target_state)
+}
+
+async fn campaign_rig_volumes_inner(
+    vm: &str,
+    volume_ids: &[&str],
+    factory: Option<VmmControllerFactory>,
+) -> Rig {
+    install_panic_filter();
+    assert!(
+        !volume_ids.is_empty(),
+        "a campaign rig needs at least one volume"
+    );
+    let volume_ids: Vec<String> = volume_ids.iter().map(ToString::to_string).collect();
+    let clock = Arc::new(AtomicU64::new(START));
+    // The stamp clock (S1): the writer's per-ack ticks and the
+    // coordinator's stamps share it; the lease clock above stays
+    // untouched by guest I/O.
+    let stamp_clock = Arc::new(AtomicU64::new(START));
+    let witness = WitnessHandle::spawn(Arc::clone(&clock)).await;
+
+    let (source, target, target_state) = seeded_fixture(&volume_ids);
 
     let snapshot_root = leak_tempdir();
     let (vmm_a, _devices_a) = wired_vmm(&snapshot_root, &source.world);
     let (vmm_b, _devices_b) = wired_vmm(&snapshot_root, &target.world);
+
+    // The controllers the daemons will drive: the Tier V factory's
+    // pair (real, mirrored over live VMM processes) or nothing —
+    // every Tier S row serves the wired views above, resolved at
+    // the launch seam.
+    let controllers = match &factory {
+        Some(build) => {
+            let (a, b) = build(Arc::clone(&vmm_a), Arc::clone(&vmm_b));
+            (Some(a), Some(b))
+        }
+        None => (None, None),
+    };
+    let (controller_a, controller_b) = controllers;
 
     // Both listeners bind first so the peer URLs are known, then the
     // daemons compose over them.
@@ -1176,6 +1263,7 @@ pub async fn campaign_rig_volumes(vm: &str, volume_ids: &[&str]) -> Rig {
         leak_tempdir(),
         config_for(&source.base),
         &vmm_a,
+        controller_a,
         addr_b,
         witness.addr,
         &stamp_clock,
@@ -1190,6 +1278,7 @@ pub async fn campaign_rig_volumes(vm: &str, volume_ids: &[&str]) -> Rig {
         leak_tempdir(),
         config_for_peer(&target.base),
         &vmm_b,
+        controller_b,
         addr_a,
         witness.addr,
         &stamp_clock,
@@ -1272,6 +1361,7 @@ impl Rig {
             journal_dir: leak_tempdir(),
             provider_config: config_for(&self.source_base),
             vmm: Arc::clone(&self.vmm_a),
+            vmm_controller: None,
             peer_addr: self.b.addr,
             witness_addr: self.witness.addr,
             clock: clock_of(&self.stamp_clock),

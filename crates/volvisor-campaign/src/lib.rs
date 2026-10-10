@@ -75,6 +75,7 @@ pub mod oracle;
 pub mod rig;
 pub mod summary;
 pub mod tier_r;
+pub mod tier_v;
 
 pub use evidence::{Evidence, LogSources, render_report, run_dir};
 pub use oracle::{AckedWrite, Verdict, WriterHandle, verify_against};

@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 
 use volvisor_campaign::matrix::{self, Family};
 use volvisor_campaign::tier_r;
+use volvisor_campaign::tier_v;
 use volvisor_campaign::{Evidence, LogSources, build_campaign_report, completion_gates_over};
 use volvisor_drbd_testkit::leak_tempdir;
 
@@ -106,8 +107,8 @@ fn oracle(
 /// The complete fixture run directory: every §9 Tier S row's
 /// records (the generated matrix cells and family aggregates, the
 /// oracle rows with their byte-level verdicts, the injection rows
-/// with their typed outcomes), every Tier R gate's skip record, and
-/// row 15's own record.
+/// with their typed outcomes), every Tier R gate's skip record,
+/// every Tier V gate's skip record, and row 15's own record.
 fn complete_fixture() -> PathBuf {
     let dir = leak_tempdir();
     fixture_matrix(&dir);
@@ -115,6 +116,7 @@ fn complete_fixture() -> PathBuf {
     fixture_injections(&dir);
     fixture_move_rows(&dir);
     fixture_tier_r_gates(&dir);
+    fixture_tier_v_gates(&dir);
     write_record(
         &dir,
         &tier_s(
@@ -311,6 +313,33 @@ fn fixture_tier_r_gates(dir: &Path) {
             &json!({
                 "scenario": format!("tier-r/{}", scenario.name),
                 "tier": "R",
+                "commit": "fixture-commit",
+                "kernel": "fixture-kernel",
+                "components": null,
+                "fault": null,
+                "oracle": null,
+                "invariants": [],
+                "logs": null,
+                "outcome": "skipped",
+                "reason": scenario.skip_reason,
+                "would_run": scenario.body,
+                "duration_ms": 1,
+            }),
+        );
+    }
+}
+
+/// The Tier V gate fixture (the same stand-in as Tier R's): every
+/// scenario's skip record with the env gate's canonical reason —
+/// the default environment's honest shape, which is what a
+/// certification tree carries.
+fn fixture_tier_v_gates(dir: &Path) {
+    for scenario in tier_v::SCENARIOS {
+        write_record(
+            dir,
+            &json!({
+                "scenario": format!("tier-v/{}", scenario.name),
+                "tier": "V",
                 "commit": "fixture-commit",
                 "kernel": "fixture-kernel",
                 "components": null,
