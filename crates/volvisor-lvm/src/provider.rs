@@ -1117,12 +1117,31 @@ impl LvmProvider {
     /// unverified outcome never freed anything); the record stays
     /// queryable by the reconcile pass, which rolls it forward if
     /// the world later proves completion.
+    ///
+    /// **A landed completion is never parked over.** Every caller
+    /// parks on a judgment made *before* this lock — a snapshot of
+    /// the record, or a world observation that may itself have
+    /// failed transiently — so the durable record is re-checked
+    /// under the lock, the same stale-snapshot discipline as
+    /// [`Self::finish_complete`]'s idempotency gate: a stored
+    /// `COMPLETE` record means the completion already landed
+    /// durably (this caller's snapshot predates it, or a concurrent
+    /// finish path won the race — including the case where this
+    /// caller's own verification observe failed transiently), and it
+    /// is answered as-is. Parking over it would resurrect the
+    /// resolved move to `IN_DOUBT`, and the next reconcile pass
+    /// would re-complete it and bump the generation a second time.
     fn park_in_doubt(
         &self,
         volume_id: &VolumeId,
         detail: String,
     ) -> Result<MoveVolumeBackingResponse, ApiError> {
         let mut state = self.lock_state()?;
+        if let Some(stored) = state.move_record(volume_id) {
+            if stored.state == MoveVolumeBackingState::Complete {
+                return Ok(Self::move_response(&state, volume_id, stored));
+            }
+        }
         // The parked record is the response (the guard's state is
         // exactly what gets persisted — no re-lock after the save).
         let response = {
@@ -1155,7 +1174,11 @@ impl LvmProvider {
     /// record — so the durable record is re-checked under the state
     /// lock: a stored `COMPLETE` record is the already-once
     /// completion and is answered as-is, bumping nothing and saving
-    /// nothing.
+    /// nothing. The transient-observation corner carries the same
+    /// discipline: a verification observe that fails (or refuses)
+    /// parks through [`Self::park_in_doubt`], which never parks
+    /// over a stored `COMPLETE` — the stored record is answered, so
+    /// the next pass re-completes nothing and bumps nothing.
     fn finish_complete(
         &self,
         volume_id: &VolumeId,
@@ -1933,8 +1956,11 @@ impl LvmProvider {
                     }
                 }
                 MoveVolumeBackingState::Copying => {
-                    // The move ended without relocating: park.
-                    self.park_in_doubt(
+                    // The move ended without relocating: park (unless
+                    // a landed completion won the race — the park
+                    // helper answers the stored truth, and the report
+                    // says park only if the record actually parked).
+                    let parked = self.park_in_doubt(
                         &volume_id,
                         format!(
                             "the pvmove ended without relocating the extents to {} \
@@ -1943,7 +1969,9 @@ impl LvmProvider {
                             record.target_pv, record.source_pv
                         ),
                     )?;
-                    report.parked_in_doubt.push(volume_id);
+                    if parked.state == MoveVolumeBackingState::InDoubt {
+                        report.parked_in_doubt.push(volume_id);
+                    }
                 }
                 MoveVolumeBackingState::InDoubt
                     if observation.restored_to_source(&record.source_pv) =>
@@ -1981,8 +2009,9 @@ impl LvmProvider {
                 .move_record(volume_id)
                 .is_some_and(|record| record.state == MoveVolumeBackingState::InDoubt)
         };
+        let mut completed_elsewhere = false;
         if !already_parked && failures >= MOVE_OBSERVE_FAILURE_BOUND {
-            self.park_in_doubt(
+            let parked = self.park_in_doubt(
                 volume_id,
                 format!(
                     "the LV {vg_name}/{lv_name} has been unobservable for {failures} \
@@ -1990,11 +2019,19 @@ impl LvmProvider {
                      silently spinning — an operator must resolve the placement"
                 ),
             )?;
+            // A landed completion won the race while this pass could
+            // not observe the world: the park helper answered the
+            // stored truth — the record did not park, so it is not
+            // reported parked (the concurrent finisher owns the
+            // completion's report).
+            completed_elsewhere = parked.state != MoveVolumeBackingState::InDoubt;
         }
-        if already_parked || failures >= MOVE_OBSERVE_FAILURE_BOUND {
-            report.parked_unobservable.push(volume_id.clone());
-        } else {
-            report.unobservable.push(volume_id.clone());
+        if !completed_elsewhere {
+            if already_parked || failures >= MOVE_OBSERVE_FAILURE_BOUND {
+                report.parked_unobservable.push(volume_id.clone());
+            } else {
+                report.unobservable.push(volume_id.clone());
+            }
         }
         Ok(())
     }

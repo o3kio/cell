@@ -199,7 +199,7 @@ refusals are typed errors raised before any state exists); the completion
 verifies the relocation to the record's **own** target PV (a foreign
 off-target relocation parks `IN_DOUBT`, never a completion), and one
 fenced generation bump lands with the verified `COMPLETE` record. The
-evidence: 32 provider-semantics tests (`move_tests.rs`, argv-exact FakeRunner), 5 daemon-level e2e rows
+evidence: 33 provider-semantics tests (`move_tests.rs`, argv-exact FakeRunner), 5 daemon-level e2e rows
 (`move_e2e.rs`), the campaign's row 16 (six durable-boundary kill/abort
 scenarios in `move_rows.rs`, the LVM sibling harness with the campaign's
 `Evidence` records), and four env-gated real-LVM integration tests
@@ -235,7 +235,19 @@ foreign move is already active on the source PV (verified against LVM
 2.03.16: the second scoped pvmove attaches and its arguments are
 ignored), and the admission match handles `FAILED` and the mirror-path
 states explicitly (the latter a typed internal refusal, never a silent
-fresh drive).
+fresh drive). The confirmation round left one residual MINOR, also
+applied: `park_in_doubt` never parks over a stored `COMPLETE` — every
+park caller judges on a pre-lock snapshot or a world observation that
+may itself have failed transiently (the finishing path's observe-Err
+corner), so the durable record is re-checked under the park's own
+lock and a landed completion is answered as-is, never regressed to
+`IN_DOUBT` (which the next pass would re-complete with a second
+generation bump); the reconcile's park-shaped report arms say
+"parked" only when the record actually parked. Pinned by a
+transient-failure choreography (a competing finish path whose
+verification observe fails once through the scripted-world seam,
+over a stored `COMPLETE` — answered, preserved, and the next pass
+bumps nothing).
 
 ## 2. P7 — packaging and distribution (ADR-0009)
 

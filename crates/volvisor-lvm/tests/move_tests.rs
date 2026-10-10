@@ -40,13 +40,17 @@
 //!   findings' pins): two overlapping supervisions of one in-flight
 //!   move — and a retry reconcile whose snapshot predates a
 //!   concurrent completion — verify the same landed world and still
-//!   bump the generation exactly once; a parked `IN_DOUBT` record
-//!   whose world verifiably shows the pre-move placement resolves
-//!   `FAILED` and admits a fresh drive, while the mixed-placement
-//!   abort stays parked; an LV unobservable across the bound parks
-//!   `IN_DOUBT` typed instead of silently spinning; and a foreign
-//!   (unrecorded) pvmove active on the source PV refuses the fresh
-//!   start typed — LVM would attach to it and ignore the arguments.
+//!   bump the generation exactly once, and a competing finish path
+//!   whose verification observe fails transiently answers the
+//!   stored `COMPLETE` instead of parking over it (the next pass
+//!   re-completes nothing, bumps nothing); a parked `IN_DOUBT`
+//!   record whose world verifiably shows the pre-move placement
+//!   resolves `FAILED` and admits a fresh drive, while the
+//!   mixed-placement abort stays parked; an LV unobservable across
+//!   the bound parks `IN_DOUBT` typed instead of silently spinning;
+//!   and a foreign (unrecorded) pvmove active on the source PV
+//!   refuses the fresh start typed — LVM would attach to it and
+//!   ignore the arguments.
 //!
 //! Test-kit code: `expect`/`unwrap` are allowed here by convention,
 //! and the bounded-wait helpers fail loudly with `panic!` on their
@@ -1394,8 +1398,9 @@ async fn a_foreign_relocation_off_target_parks_in_doubt() {
 
 // ---------------------------------------------------------------------------
 // The concurrency and resolution discipline (the review findings'
-// pins): one bump under overlapping completions, the IN_DOUBT
-// rollback exit, the unobservable-LV bound, the foreign-source scan
+// pins): one bump under overlapping completions (including the
+// transient-verification corner), the IN_DOUBT rollback exit, the
+// unobservable-LV bound, the foreign-source scan
 // ---------------------------------------------------------------------------
 
 /// Two consumer operations supervising the **same** in-flight move
@@ -1604,6 +1609,140 @@ async fn a_reconcile_snapshot_from_before_the_completion_never_bumps_again() {
     );
     // The pass started no pvmove of its own: the drive's attach is
     // the only one.
+    assert_eq!(pvmove_count(&runner), 1);
+}
+
+/// The observe-Err corner of the completion's once-only bump: a
+/// competing finish path — the retry reconcile over a
+/// pre-completion snapshot — whose verification observe fails
+/// **transiently** must not park over the durably stored
+/// `COMPLETE`. The park helper answers the stored record (the same
+/// discipline as the idempotency gate), the landed completion never
+/// regresses to `IN_DOUBT`, and the next pass re-completes nothing
+/// and bumps nothing. Without the guard, the clobbered record would
+/// re-complete on the next pass and bump the generation a second
+/// time.
+#[tokio::test]
+async fn a_transient_verification_failure_never_parks_over_a_stored_complete() {
+    let fixture = move_fixture();
+    let volume = "vol-move-transient-verify-flake";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // The dead incarnation's durable facts: a COPYING record and a
+    // live, held pvmove (the crash shape between the pvmove start
+    // and its landing).
+    seed_move(
+        &fixture.state_path,
+        volume,
+        MOVE_SOURCE_PV,
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::Copying,
+    );
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.moves.insert(
+            lv_path(volume),
+            common::FakeMove {
+                source: MOVE_SOURCE_PV.to_owned(),
+                target: MOVE_TARGET_PV.to_owned(),
+                percent: 0,
+            },
+        );
+        world.hold_moves = true;
+    }
+
+    // The competing finish path: the retry reconcile on its own
+    // thread against a provider whose runner parks that thread's
+    // first `lvs` (its own world observation, after its COPYING
+    // snapshot) and fails its **second** `lvs` exactly once — the
+    // finishing verification's transient observe failure, injected
+    // through the scripted-world seam.
+    let flake = FinishingFlake::new();
+    let (provider, runner) = flaked_provider(&fixture.state_path, &fixture.world, &flake);
+    let (thread_tx, thread_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel();
+    let (report_tx, report_rx) = mpsc::channel();
+    let reconcile = {
+        let provider = Arc::clone(&provider);
+        thread::spawn(move || {
+            thread_tx
+                .send(thread::current().id())
+                .expect("send the reconcile thread id");
+            go_rx.recv().expect("receive the go signal");
+            report_tx
+                .send(provider.move_reconcile_pass())
+                .expect("send the pass report");
+        })
+    };
+    flake.arm(thread_rx.recv().expect("the reconcile thread id"));
+    go_tx.send(()).expect("release the reconcile thread");
+    flake.wait_until_paused();
+
+    // The re-attach drive completes the move behind the snapshot:
+    // attach to the held mirror, supervise, release the world, land,
+    // verify, ONE bump — the stored COMPLETE is durable.
+    let drive = tokio::spawn({
+        let provider = Arc::clone(&provider);
+        let volume = volume_id(volume);
+        async move {
+            provider
+                .move_volume_backing(&volume, &move_request("op-drive", MOVE_TARGET_PV, 1))
+                .await
+        }
+    });
+    wait_for_record(&fixture.state_path, volume, |record| {
+        record.operation_id.as_str() == "op-drive"
+    })
+    .await;
+    fixture.world.lock().expect("world").hold_moves = false;
+    let response = drive
+        .await
+        .expect("join the drive")
+        .expect("the drive completes");
+    assert_eq!(response.state, MoveVolumeBackingState::Complete);
+    assert_eq!(response.generation, 2);
+
+    // The reconcile thread resumes: its own observation sees the
+    // landed relocation, its finishing verification observe fails
+    // transiently — and the stored COMPLETE is the durable truth,
+    // answered, never parked over.
+    flake.release();
+    reconcile.join().expect("join the reconcile thread");
+    let report = report_rx
+        .recv()
+        .expect("the pass report")
+        .expect("the pass");
+    assert_eq!(report.completed, vec![volume_id(volume)]);
+    assert_eq!(report.parked_in_doubt, Vec::new());
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    let record = record.expect("the record");
+    assert_eq!(
+        record.state,
+        MoveVolumeBackingState::Complete,
+        "the transient verification failure never regressed the landed completion to IN_DOUBT"
+    );
+    assert_eq!(
+        generation, 2,
+        "the landed completion's bump is the only one — no clobber, no re-completion"
+    );
+
+    // The failure was transient: the world is observable again, and
+    // the next pass completes nothing over the stored truth.
+    let report = provider.move_reconcile_pass().expect("the next pass");
+    assert_eq!(report.completed, Vec::new());
+    assert_eq!(report.parked_in_doubt, Vec::new());
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2, "no second bump on the next pass");
+    // The passes started no pvmove of their own: the drive's attach
+    // is the only one.
     assert_eq!(pvmove_count(&runner), 1);
 }
 
@@ -2098,6 +2237,113 @@ fn gated_provider(
             pause.pause_reconcile_thread(program);
             let mut world = world.lock().ok()?;
             common::script(&mut world, program, args)
+        }))
+    };
+    let provider = LvmProvider::new(
+        Arc::clone(&runner) as Arc<dyn volvisor_provider::CommandRunner>,
+        state_path.to_path_buf(),
+        common::leak_tempdir(),
+        common::VG_PREFIX.to_owned(),
+        common::AUTH_TOKEN.to_owned(),
+    )
+    .map(|provider| {
+        Arc::new(
+            provider.with_move_timing(volvisor_lvm::provider::MoveTiming {
+                poll_interval: Duration::from_millis(5),
+                supervision_window: Duration::from_secs(30),
+            }),
+        )
+    })
+    .expect("provider construction");
+    (provider, runner)
+}
+
+/// The competing-finish choreography: the armed thread's first
+/// `lvs` (the pass's own world observation, after its record
+/// snapshot) parks until released — the [`ReconcilePause`] stage —
+/// and its **second** `lvs`, the finishing path's verification
+/// observe, fails exactly once through the scripted-world seam
+/// (`fail_lvs`), restored immediately after: a transient observe
+/// failure, not an outage. The deterministic shape of the observe-Err
+/// corner: a completion lands durably behind the pass's snapshot,
+/// and the resumed finishing path cannot observe the world it is
+/// about to judge.
+#[derive(Clone)]
+struct FinishingFlake {
+    pause: ReconcilePause,
+    flake: Arc<Mutex<Option<(thread::ThreadId, u32)>>>,
+}
+
+impl FinishingFlake {
+    fn new() -> Self {
+        Self {
+            pause: ReconcilePause::new(),
+            flake: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Arm both stages for `thread` (called once its id is known).
+    fn arm(&self, thread: thread::ThreadId) {
+        self.pause.arm(thread);
+        *self.flake.lock().expect("flake state") = Some((thread, 0));
+    }
+
+    /// Park the armed thread's first `lvs` (the pause stage), then
+    /// report whether this call is the transient failure (the armed
+    /// thread's second `lvs`).
+    fn intercept(&self, program: &str) -> bool {
+        self.pause.pause_reconcile_thread(program);
+        if program != "lvs" {
+            return false;
+        }
+        let mut flake = self.flake.lock().expect("flake state");
+        match flake.as_mut() {
+            Some((thread, count)) if *thread == thread::current().id() => {
+                *count += 1;
+                *count == 2
+            }
+            _ => false,
+        }
+    }
+
+    /// Block (bounded) until the armed thread is parked.
+    fn wait_until_paused(&self) {
+        self.pause.wait_until_paused();
+    }
+
+    /// Release the parked thread.
+    fn release(&self) {
+        self.pause.release();
+    }
+}
+
+/// A provider over the fixture's state file and world whose runner
+/// wraps the kit's script with the [`FinishingFlake`] choreography
+/// (plus the runner itself, for invocation assertions). The timing
+/// is the long-window shape: the drive under test must supervise
+/// well past the choreography's waits.
+fn flaked_provider(
+    state_path: &std::path::Path,
+    world: &Arc<Mutex<common::FakeLvm>>,
+    flake: &FinishingFlake,
+) -> (Arc<LvmProvider>, Arc<FakeRunner>) {
+    let runner = {
+        let world = Arc::clone(world);
+        let flake = flake.clone();
+        Arc::new(FakeRunner::with_closure(move |program, args| {
+            let fail_this = flake.intercept(program);
+            let mut world = world.lock().ok()?;
+            if fail_this {
+                // The transient observe failure, injected through
+                // the scripted-world seam and restored immediately
+                // after the one call.
+                world.fail_lvs = true;
+            }
+            let output = common::script(&mut world, program, args);
+            if fail_this {
+                world.fail_lvs = false;
+            }
+            output
         }))
     };
     let provider = LvmProvider::new(

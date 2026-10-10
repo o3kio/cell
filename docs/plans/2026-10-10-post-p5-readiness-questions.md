@@ -338,7 +338,11 @@ Evidence:
     parked `IN_DOUBT`; the kernel-internal
     mirror makes `MIRROR_READY`/`PIVOTED` unobservable through `lvs`;
     scope refusals are typed errors before any state exists), one fenced
-    generation bump landing with the verified `COMPLETE` record, unknown
+    generation bump landing with the verified `COMPLETE` record (the
+    bump once-only across every competing path — overlapping
+    supervisions, stale reconcile snapshots, and a transiently
+    failing verification observe, which answers a stored `COMPLETE`
+    instead of parking over it), unknown
     outcomes — an out-of-band `pvmove --abort` included — parked
     `IN_DOUBT` with the source intact and new work refused typed until
     the reconcile resolves the park (a verifiable rollback to the source
