@@ -528,7 +528,10 @@ two P8 decisions recorded closed — the engine-comparison gate stays
 closed for want of honest measurements, and the local-mirror experiment
 is declined with its reopenable sketch (#28); and the device-lending
 surface of the rook-cell contract, daemon-tested to its six invariants
-(#29). The workspace suite stands at 1043 tests, and the campaign
+(#29); and, after the closing record was first drafted, the shared
+operation-id namespace hardening (F5 of PR #23's review) landed as PR
+#31 — derived peer ids in a reserved, consumer-unreachable namespace.
+The workspace suite stands at 1046 tests, and the campaign
 certification (CG1–CG5) passed at every stage's head — the honesty
 rules of §0 held throughout: no artifact of P6–P9 claims production
 support, real-media durability, or anything else its evidence does not
@@ -545,13 +548,15 @@ scenario's notified leg needs a host whose Cloud Hypervisor carries the
 predates it, and the refusal branch was recorded). The grant_set
 wedge's convergence horizon: a park that outlives the 60 s lease TTL
 spins honestly with no re-mint path — the remedy directions are
-recorded in the diagnosis doc, not shipped. Two backlog pins the phase
-leaves open, recorded rather than silently dropped: the shared
-operation-id namespace hardening (F5 of PR #23's review — DoS-class,
-no reproduction; the remedy directions stand in the readiness plan
-§1) and the Tier R real-host drive (scaffolded, skipped honestly,
-hardware-gated — the campaign's gate records and the nearline §10 note
-carry its state).
+recorded in the diagnosis doc, not shipped. One backlog pin the phase
+leaves open, recorded rather than silently dropped: the Tier R
+real-host drive (scaffolded, skipped honestly, hardware-gated — the
+campaign's gate records and the nearline §10 note carry its state). The
+shared operation-id namespace hardening (F5 of PR #23's review) was
+left open when this section was first drafted and is now **resolved in
+PR #31** — derived peer ids render in the reserved `derived:` namespace,
+unreachable from the consumer surface, with typed refusals at every
+journaling consumer route.
 
 **P10.** Not authorized by this plan (§5 above) and still not
 authorized by anything the phase produced: it is gated on P9's outcome
