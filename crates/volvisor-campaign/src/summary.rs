@@ -941,7 +941,7 @@ const DISCLAIMING_PREFIXES: [&str; 5] = ["no ", "not ", "never ", "n't ", "nor "
 /// a negation before a NOUN-phrase claim ("production support",
 /// "real-host", …) disclaims only when the phrase is the object
 /// being disclaimed — "no real-host CLAIM is made". The negation +
-/// "no <phrase> GAP remains" shape is a claim wearing a negation
+/// `no <phrase> GAP remains` shape is a claim wearing a negation
 /// (it asserts the property was verified), so the words that may
 /// follow a disclaimed noun phrase name the claim act itself.
 /// ("proven on hardware" — a verb phrase — is its own claim act:
