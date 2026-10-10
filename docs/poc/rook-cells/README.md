@@ -1,6 +1,6 @@
 # Rook-only Volvisor Cell experimental POC — GO / NO-GO
 
-Status: **DESIGN + EXAMPLE INPUTS ONLY; not run**
+Status: **DESIGN + EXAMPLE INPUTS ONLY; not run** — the Volvisor-side device-lending surface is now implemented and daemon-tested (see section 3), which changes nothing about the run status: no real-host scenario below has been executed.
 Related: [ADR-0008](../../adr/0008-rook-only-hyperconverged-cells.md)
 Target: prove feasibility of hyperconverged Rook/Ceph inside fixed-budget Cloud Hypervisor storage microVMs without patching Rook.
 
@@ -36,7 +36,7 @@ Reference conservative cell budget: 6 vCPUs pinned/charged to physical host allo
 
 1. Provision independent, long-lived Kubernetes API/etcd nodes, DNS, authenticated CNI and routing from cells and Ceph clients. Avoid self-hosting API/etcd or cell root/state on this Ceph cluster.
 2. Pin guest image with Linux NVMe, VFIO guest support, kubelet/containerd, Ceph kernel/userland prerequisites and diagnostics. Cell has no admin kubeconfig baked in.
-3. Volvisor host agent discovers each physical NVMe, verifies stable ID and IOMMU isolation, journals explicit controller claim and binds VFIO before CHV `--device` passthrough. No controller may be simultaneously claimed by host native storage/other VM.
+3. Volvisor host agent discovers each physical NVMe, verifies stable ID and IOMMU isolation, journals explicit controller claim, lends it to the cell's identity through the device-lending surface (section 3) and binds VFIO before CHV `--device` passthrough. No controller may be simultaneously claimed by host native storage/other VM.
 4. Allocate cell fixed CPU/RAM, local root/state volume and NIC(s); boot and verify `lspci -nnk`, `lsblk -o NAME,SERIAL,SIZE,TYPE,FSTYPE,MOUNTPOINTS`, exact by-id path, NVMe firmware/health and clean signatures inside guest. Show physical host cannot still issue NVMe writes to it.
 5. Join each cell to external Kubernetes control plane with stable node name. Require three `Ready` Node objects after CNI/bootstrap. Apply topology labels and taint from trusted management automation **after configuring taint tolerations for essential `kube-system` CNI agents**, so network does not deadlock.
 6. Configure admission policy: only approved Rook/Ceph namespace/service accounts and preapproved kube-system DaemonSets can schedule on `volvisor-cell` nodes. Prove a tenant Pod with an attempted toleration is refused. Taints alone do not secure nodes.
@@ -50,6 +50,12 @@ Reference conservative cell budget: 6 vCPUs pinned/charged to physical host allo
 [Example cell claim and resource plan](cell-plan.example.yaml) is illustrative YAML **not an executable current Volvisor API**. An implementation must create/version the machine-readable plan separately, with immutable storage device IDs and trusted host/guest identity verification before any mutation. An illustrative [kubelet configuration](kubelet-config.example.yaml) shows the in-guest system/kube reservation and eviction starting point for the fixed 6 vCPU / 16 GiB cell budget.
 
 The Kubernetes CephCluster CR is the **real Rook integration surface**. Disk paths are guest-visible and must be revalidated on every cell restart; the host claim is an independent Volvisor transaction. Rook's RBD StorageClass is optional for Kubernetes CSI consumers; O3K's direct Ceph RBD volume adapter can use an existing cluster with host-level mapping and appropriate Ceph credentials without running guest workloads inside cells.
+
+### The Volvisor device-lending surface (implemented; not run on real hosts)
+
+The operator surface behind step 3's lend is implemented (P9-A): `LendDevice` (borrower cell + expected claim generation), `ReclaimDevice` (expected lend generation, with the operator-authorized force path carrying an explicit recorded residue check), the read-only `DeviceOwnership` answer, and `ResolveQuarantine` — the only exit from a quarantine — over volvisor-claimed devices, served by the volvisord admin routes `POST /v2/admin/devices/{device_id}/lend|reclaim|resolve-quarantine` and `GET /v2/admin/devices/{device_id}/ownership`. Claim, lend and reclaim are generations of one durable ownership record, so the claim is never surrendered and there is no double-ownership window; a crash between a journaled lend/reclaim and its effect leaves the device quarantined (never an inferred state), and foreign residue on reclaim quarantines the device — the C09 "no automatic reuse of unknown disk" discipline. Each of the contract's six lending invariants is carried by a daemon-level Tier S test in `volvisor-api` over the durable fake.
+
+Two boundaries are deliberately still open. The release/residue observation is a named seam (`DeviceSurfaceObserver`): the Tier S world models the borrower signature, and the real leg — wiped vs an OSD superblock vs a foreign signature on the passed NVMe media — is P9-B work against the same trait. The volvisord runtime wiring of the surface arrives with that leg; until then the routes serve the typed 404 for providers without one. Neither the implementation nor the daemon-level tests are real-device evidence: **not run** here means exactly that — the C01–C14 matrix above is unchanged, and "not run" is a statement about evidence, not about implementation.
 
 ## 4. Fault injection and GO/NO-GO matrix
 
