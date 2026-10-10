@@ -333,12 +333,17 @@ Evidence:
     **Delivered in P6-C (PR #24)**: `POST /v2/volumes/{volume_id}/move-backing`
     under the advertised `same_vg_extent_move` capability —
     journal-before-mutate, the honest state subset
-    `PREPARING | COPYING | COMPLETE | IN_DOUBT` (the kernel-internal
+    `PREPARING | COPYING | COMPLETE | IN_DOUBT` plus `FAILED` written by
+    the retry reconcile alone (the verified-rollback resolution of a
+    parked `IN_DOUBT`; the kernel-internal
     mirror makes `MIRROR_READY`/`PIVOTED` unobservable through `lvs`;
     scope refusals are typed errors before any state exists), one fenced
     generation bump landing with the verified `COMPLETE` record, unknown
     outcomes — an out-of-band `pvmove --abort` included — parked
-    `IN_DOUBT` with the source intact and new work refused typed, and no
+    `IN_DOUBT` with the source intact and new work refused typed until
+    the reconcile resolves the park (a verifiable rollback to the source
+    resolves `FAILED` and admits a fresh drive; the mixed-placement abort
+    stays parked), and no
     consumer abort route in this slice.
   - **Option B (QSD `blockdev-mirror` + pivot over vhost-user-blk)**:
     general per-volume pool-to-pool moves. Explicitly gated: "QSD command

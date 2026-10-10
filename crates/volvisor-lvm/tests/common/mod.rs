@@ -222,8 +222,9 @@ fn report(key: &str, rows: &[serde_json::Value]) -> CommandOutput {
 }
 
 /// The `lvs` report rows for the simulated world (pass the query's
-/// `args` so later kit pieces can key on them — the kit's `script` is
-/// also public for tests that wrap it with their own choreography).
+/// `args` so `-a` can include the hidden mirror rows — the kit's
+/// `script` is also public for tests that wrap it with their own
+/// choreography).
 ///
 /// Also the deterministic move clock: every `lvs` query advances each
 /// active move by [`FakeLvm::move_advance_percent`] (unless held), and
@@ -233,7 +234,13 @@ fn report(key: &str, rows: &[serde_json::Value]) -> CommandOutput {
 /// mid-move shape**: the `devices` column references the `pvmove0`
 /// mirror segment and `copy_percent` is empty (the progress lives on
 /// the hidden segment, not the LV row).
-fn lvs_report(world: &mut FakeLvm, _args: &[&str]) -> CommandOutput {
+///
+/// With `-a` among the query's args, the **verified LVM 2.03.16
+/// hidden-row shape** is included: one `[pvmoveN]` row per active
+/// move, whose `devices` column names exactly the source and target
+/// PVs that move involves (the only `lvs`-observable naming of a
+/// move's PVs — the foreign-move scan reads it).
+fn lvs_report(world: &mut FakeLvm, args: &[&str]) -> CommandOutput {
     advance_moves(world);
     // The deceptive-completion knob's scheduled half: placements that
     // restore on this query, before the rows are reported.
@@ -254,12 +261,21 @@ fn lvs_report(world: &mut FakeLvm, _args: &[&str]) -> CommandOutput {
         }
         world.freed_sightings.remove(&path);
     }
+    // Each active move's hidden-segment index (report order): the
+    // moving LV references `pvmoveN(0)` and the hidden row is
+    // `[pvmoveN]`, exactly as LVM 2.03.16 prints them.
+    let segment_of: BTreeMap<&str, usize> = world
+        .moves
+        .keys()
+        .enumerate()
+        .map(|(index, path)| (path.as_str(), index))
+        .collect();
     let mut rows: Vec<serde_json::Value> = Vec::new();
     for (path, size) in &world.lvs {
         let (vg, lv) = path.split_once('/').expect("path is vg/lv");
         let moving = world.moves.contains_key(path);
-        let mut devices = if moving {
-            "pvmove0(0)".to_owned()
+        let mut devices = if let Some(index) = segment_of.get(path.as_str()) {
+            format!("pvmove{index}(0)")
         } else {
             world
                 .lv_devices
@@ -308,6 +324,24 @@ fn lvs_report(world: &mut FakeLvm, _args: &[&str]) -> CommandOutput {
             "copy_percent": "",
             "devices": devices,
         }));
+    }
+    // The `-a` half: the hidden mirror rows, one per active move.
+    // Verified LVM 2.03.16 shape (probed against a live scoped
+    // pvmove): the row prints as `[pvmoveN]`, its `devices` column
+    // names the source and target PVs, and it disappears from the
+    // report once the move lands or aborts.
+    if args.contains(&"-a") {
+        for (index, (path, move_)) in world.moves.iter().enumerate() {
+            let (vg, _) = path.split_once('/').expect("path is vg/lv");
+            rows.push(serde_json::json!({
+                "vg_name": vg,
+                "lv_name": format!("[pvmove{index}]"),
+                "lv_size": "0",
+                "lv_attr": "p-C-aom---",
+                "copy_percent": "",
+                "devices": format!("{}(0),{}(0)", move_.source, move_.target),
+            }));
+        }
     }
     report("lv", &rows)
 }

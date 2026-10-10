@@ -191,14 +191,15 @@ fault rows; the contract letter and the implementation agree.
 target qualification, source derivation, pvmove start with the honest
 failed-start classification, and supervision — plus the daemon's 5-s move
 retry reconcile pass. The state map is the honest subset
-`PREPARING | COPYING | COMPLETE | IN_DOUBT` (`MIRROR_READY`/`PIVOTED` are
-kernel-internal and unobservable through `lvs`; scope and admission
-refusals are typed errors raised before any state exists — no `FAILED`
-move record is ever written); the completion verifies the relocation to
-the record's **own** target PV (a foreign off-target relocation parks
-`IN_DOUBT`, never a completion), and one fenced generation bump lands
-with the verified `COMPLETE` record. The evidence: 26 provider-semantics
-tests (`move_tests.rs`, argv-exact FakeRunner), 5 daemon-level e2e rows
+`PREPARING | COPYING | COMPLETE | IN_DOUBT` plus `FAILED` written by the
+retry reconcile alone (the verified-rollback resolution of a parked
+`IN_DOUBT` — see the remediation note below; `MIRROR_READY`/`PIVOTED`
+are kernel-internal and unobservable through `lvs`; scope and admission
+refusals are typed errors raised before any state exists); the completion
+verifies the relocation to the record's **own** target PV (a foreign
+off-target relocation parks `IN_DOUBT`, never a completion), and one
+fenced generation bump lands with the verified `COMPLETE` record. The
+evidence: 32 provider-semantics tests (`move_tests.rs`, argv-exact FakeRunner), 5 daemon-level e2e rows
 (`move_e2e.rs`), the campaign's row 16 (six durable-boundary kill/abort
 scenarios in `move_rows.rs`, the LVM sibling harness with the campaign's
 `Evidence` records), and four env-gated real-LVM integration tests
@@ -210,6 +211,31 @@ intact, and the mid-supervision abort parking without ever freeing the
 source. The stage used the real-LVM integration path for the world and
 the fake for the deterministic fault clock — both, recorded here per the
 test/evidence clause.
+
+**PR #24 review remediation (same branch, follow-up commits).** One
+MAJOR, two MINORs and four NITs, all applied: (MAJOR) `finish_complete`
+is now idempotent — the durable record is re-checked under the state
+lock, so two overlapping supervisions of one in-flight move and a retry
+reconcile whose snapshot predates a concurrent completion both answer
+the stored `COMPLETE` record and the generation bumps exactly once,
+pinned by two new concurrency tests (one drives two overlapping
+re-attach supervisions; one choreographs the stale-snapshot reconcile
+against a completing drive through a runner-level pause seam);
+(MINOR) `IN_DOUBT` gained its rollback exit — the retry reconcile
+resolves a parked record whose world verifiably shows the pre-move
+placement to a `FAILED` record (written by the reconcile alone; a fresh
+operation is admitted and supersedes it), while the mixed-placement
+abort stays parked; (MINOR) contract §4A's in-band outcome wording now
+names `COPYING`; (NITs) the idempotent `COMPLETE` answer is documented
+as the record's historical truth (no world re-observation), an LV
+unobservable across the bound (3 consecutive passes) parks `IN_DOUBT`
+typed instead of silently spinning, the fresh-start path world-scans
+`lvs -a`'s hidden `pvmove*` mirror rows and refuses typed when a
+foreign move is already active on the source PV (verified against LVM
+2.03.16: the second scoped pvmove attaches and its arguments are
+ignored), and the admission match handles `FAILED` and the mirror-path
+states explicitly (the latter a typed internal refusal, never a silent
+fresh drive).
 
 ## 2. P7 — packaging and distribution (ADR-0009)
 

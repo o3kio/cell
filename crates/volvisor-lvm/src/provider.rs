@@ -330,6 +330,28 @@ impl LvmProvider {
         state.save_with_hooks(&self.state_path, Some(&self.store_crash))
     }
 
+    /// Count one more consecutive world-observe failure for a move
+    /// record (the unobservable-LV limbo bound's counter; advisory
+    /// only — a poisoned lock reports past the bound so the record
+    /// parks, the fail-closed direction, never spins).
+    fn bump_move_observe_failures(&self, volume_id: &VolumeId) -> u32 {
+        self.move_observe_failures
+            .lock()
+            .map_or(MOVE_OBSERVE_FAILURE_BOUND, |mut failures| {
+                let count = failures.entry(volume_id.clone()).or_insert(0);
+                *count += 1;
+                *count
+            })
+    }
+
+    /// Clear a record's consecutive world-observe failure count (a
+    /// successful observation, a completed record, or a dropped one).
+    fn clear_move_observe_failures(&self, volume_id: &VolumeId) {
+        if let Ok(mut failures) = self.move_observe_failures.lock() {
+            failures.remove(volume_id);
+        }
+    }
+
     /// Lock the in-memory state, mapping poisoning to `INTERNAL`.
     pub(crate) fn lock_state(&self) -> Result<MutexGuard<'_, LvmState>, ApiError> {
         self.state.lock().map_err(|_| {
@@ -1214,28 +1236,6 @@ impl LvmProvider {
     /// mid-move outcome parks `IN_DOUBT`; the window expiring with
     /// the move progressing answers `COPYING` (a truthful
     /// observation of this call, not a completion claim).
-    /// Count one more consecutive world-observe failure for a move
-    /// record (the unobservable-LV limbo bound's counter; advisory
-    /// only — a poisoned lock reports past the bound so the record
-    /// parks, the fail-closed direction, never spins).
-    fn bump_move_observe_failures(&self, volume_id: &VolumeId) -> u32 {
-        self.move_observe_failures
-            .lock()
-            .map_or(MOVE_OBSERVE_FAILURE_BOUND, |mut failures| {
-                let count = failures.entry(volume_id.clone()).or_insert(0);
-                *count += 1;
-                *count
-            })
-    }
-
-    /// Clear a record's consecutive world-observe failure count (a
-    /// successful observation, a completed record, or a dropped one).
-    fn clear_move_observe_failures(&self, volume_id: &VolumeId) {
-        if let Ok(mut failures) = self.move_observe_failures.lock() {
-            failures.remove(volume_id);
-        }
-    }
-
     /// Phase 1 — qualify a move request under the state lock: the
     /// generation fence, the lifecycle admission, and the existing
     /// record's shape (an idempotent re-observation answers; an
@@ -1509,6 +1509,49 @@ impl LvmProvider {
         Ok(Some(source))
     }
 
+    /// Phase 2c — the fresh-start world scan for a foreign
+    /// (unrecorded) pvmove already active on the source PV.
+    ///
+    /// Verified LVM 2.03.16 behavior: a scoped `pvmove` whose source
+    /// PV already carries an active move attaches to it, **ignores
+    /// its arguments** and exits 0 — a silent no-op (the probe: a
+    /// second scoped move prints `Detected pvmove in progress` and
+    /// the LV never moves). The records-only same-source guard in
+    /// [`Self::derive_move_source`] sees volvisor's own journaled
+    /// moves; an out-of-band operator move is invisible to it, so
+    /// the world is scanned directly: with `-a`, `lvs` reports the
+    /// hidden `pvmove*` mirror LVs, and their device lists name
+    /// exactly the PVs each active move involves.
+    fn guard_fresh_move_source(&self, vg_name: &str, source_pv: &str) -> Result<(), ApiError> {
+        let output = self.runner.run("lvs", move_scan_lvs_args())?;
+        if !output.success {
+            return Err(command_failed("lvs", &output));
+        }
+        let rows: Vec<LvRow> = crate::report::parse_report(&output.stdout, "lv")?;
+        let foreign = rows.iter().find(|row| {
+            row.vg_name.as_deref() == Some(vg_name)
+                && row.lv_name.as_deref().is_some_and(|name| {
+                    name.trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .starts_with("pvmove")
+                })
+                && row.device_pvs().contains(&source_pv)
+        });
+        if let Some(row) = foreign {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "a foreign pvmove is already active on source PV {source_pv} (the hidden \
+                     mirror segment {} lists it); LVM would attach this move to it and \
+                     ignore its arguments — a silent no-op — so the move is refused until \
+                     the foreign move ends",
+                    row.lv_name.as_deref().unwrap_or("pvmove*")
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     async fn move_volume_backing_inner(
         &self,
         volume_id: &VolumeId,
@@ -1563,6 +1606,14 @@ impl LvmProvider {
             &observation,
             &target_row,
         )?;
+        // Phase 2c — the fresh-start world scan: the records-only
+        // same-source guard cannot see an out-of-band move, so the
+        // world itself must verifiably carry no active pvmove on the
+        // source PV before a fresh pvmove starts (a re-attach skips
+        // it: attaching to our own journaled move is the point).
+        if let Some(source_pv) = source_pv.as_deref() {
+            self.guard_fresh_move_source(&vg_name, source_pv)?;
+        }
 
         // Phase 3 — journal the intent. The record is the
         // reconciliation anchor: after this save, a daemon death
@@ -1781,11 +1832,11 @@ impl LvmProvider {
     ///
     /// Never destructive: an unobservable record is skipped and
     /// retried (parking `IN_DOUBT` at the consecutive-failure bound
-    /// so it surfaces), an unrelocated `COPYING` record parks `IN_DOUBT`,
-    /// a parked `IN_DOUBT` record whose world verifiably shows the
-    /// pre-move placement resolves `FAILED` (the known rollback
-    /// outcome; the mixed-placement park stays parked), and nothing
-    /// but a verified relocation ever completes.
+    /// so it surfaces), an unrelocated `COPYING` record parks
+    /// `IN_DOUBT`, a parked `IN_DOUBT` record whose world verifiably
+    /// shows the pre-move placement resolves `FAILED` (the known
+    /// rollback outcome; the mixed-placement park stays parked), and
+    /// nothing but a verified relocation ever completes.
     fn reconcile_moves(&self, redrive: bool) -> Result<MoveReconcileReport, ApiError> {
         let mut report = MoveReconcileReport::default();
         let snapshot: Vec<(VolumeId, crate::state::MoveRecord)> = {
@@ -1839,7 +1890,6 @@ impl LvmProvider {
                     continue;
                 }
             };
-
             if observation.moving {
                 // The move is alive (whether this daemon started it
                 // or a previous incarnation did): the record must say
@@ -1935,8 +1985,8 @@ impl LvmProvider {
             self.park_in_doubt(
                 volume_id,
                 format!(
-                    "the LV {vg_name}/{lv_name} has been unobservable for {failures} \\
-                     consecutive reconcile passes ({error}); the record parks instead of \\
+                    "the LV {vg_name}/{lv_name} has been unobservable for {failures} \
+                     consecutive reconcile passes ({error}); the record parks instead of \
                      silently spinning — an operator must resolve the placement"
                 ),
             )?;
@@ -2136,6 +2186,27 @@ fn move_lvs_args() -> &'static [&'static str] {
         "--nosuffix",
         "-o",
         "vg_name,lv_name,lv_attr,copy_percent,devices",
+    ]
+}
+
+/// The foreign-move scan's `lvs` arguments: the shared JSON
+/// arguments plus `-a` and the columns the scan reads. `-a` is the
+/// load-bearing flag: the temporary `pvmove*` mirror LVs are hidden
+/// from the default report, and their device lists are the only
+/// `lvs`-observable naming of **which PVs** an active move involves
+/// (shaped and verified against LVM 2.03.16's JSON report — the
+/// hidden row prints as `[pvmove0]` with `devices` naming the source
+/// and target PVs).
+fn move_scan_lvs_args() -> &'static [&'static str] {
+    &[
+        "-a",
+        "--reportformat",
+        "json",
+        "--units",
+        "b",
+        "--nosuffix",
+        "-o",
+        "vg_name,lv_name,devices",
     ]
 }
 

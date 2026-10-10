@@ -44,7 +44,9 @@
 //!   whose world verifiably shows the pre-move placement resolves
 //!   `FAILED` and admits a fresh drive, while the mixed-placement
 //!   abort stays parked; an LV unobservable across the bound parks
-//!   `IN_DOUBT` typed instead of silently spinning.
+//!   `IN_DOUBT` typed instead of silently spinning; and a foreign
+//!   (unrecorded) pvmove active on the source PV refuses the fresh
+//!   start typed — LVM would attach to it and ignore the arguments.
 //!
 //! Test-kit code: `expect`/`unwrap` are allowed here by convention,
 //! and the bounded-wait helpers fail loudly with `panic!` on their
@@ -1393,7 +1395,7 @@ async fn a_foreign_relocation_off_target_parks_in_doubt() {
 // ---------------------------------------------------------------------------
 // The concurrency and resolution discipline (the review findings'
 // pins): one bump under overlapping completions, the IN_DOUBT
-// rollback exit, the unobservable-LV bound
+// rollback exit, the unobservable-LV bound, the foreign-source scan
 // ---------------------------------------------------------------------------
 
 /// Two consumer operations supervising the **same** in-flight move
@@ -1867,6 +1869,98 @@ async fn an_lv_unobservable_across_the_bound_parks_in_doubt_typed() {
     assert_eq!(
         record.expect("record").state,
         MoveVolumeBackingState::Failed
+    );
+}
+
+/// The fresh-start foreign-source scan: an out-of-band (unrecorded)
+/// pvmove already active on the source PV would swallow volvisor's
+/// scoped pvmove — verified LVM 2.03.16 behavior: the second move
+/// attaches, its arguments are IGNORED, it exits 0, and the LV never
+/// moves. The fresh start is refused typed from the world itself
+/// (the hidden `pvmove*` mirror rows name the PVs they involve),
+/// before any record exists and before any pvmove runs.
+#[tokio::test]
+async fn a_foreign_pvmove_on_the_source_pv_refuses_the_fresh_start_typed() {
+    let fixture = move_fixture();
+    let volume = "vol-move-foreign-source";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // A foreign, unrecorded pvmove evacuates another LV of the VG
+    // off the same source PV (held, so it stays observable through
+    // the scan — nothing of volvisor's knows about it).
+    {
+        let mut world = fixture.world.lock().expect("world");
+        let other = format!("{CLAIMED_VG}/vol-move-other-lv");
+        world.lvs.insert(other.clone(), 64 * MIB);
+        world
+            .lv_devices
+            .insert(other.clone(), vec![MOVE_SOURCE_PV.to_owned()]);
+        world.moves.insert(
+            other,
+            common::FakeMove {
+                source: MOVE_SOURCE_PV.to_owned(),
+                target: "/dev/pv-c".to_owned(),
+                percent: 0,
+            },
+        );
+        world.hold_moves = true;
+    }
+
+    let error = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-1", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("the fresh start is refused typed");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+    assert!(
+        error
+            .detail
+            .contains("a foreign pvmove is already active on source PV"),
+        "the refusal names the foreign move on the source: {error}"
+    );
+
+    // Refused before any state exists: no record, no pvmove, the
+    // volume's placement untouched.
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert!(record.is_none(), "a phase-2 refusal journals nothing");
+    assert_eq!(generation, 1);
+    assert_eq!(pvmove_count(&fixture.runner), 0, "no pvmove was started");
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_SOURCE_PV.to_owned()]
+    );
+
+    // Argv-exact: the scan ran through the hidden-mirror query —
+    // `-a` plus the scan's column set (the only place the PVs an
+    // active move involves are lvs-observable).
+    let scan = fixture
+        .runner
+        .invocations()
+        .into_iter()
+        .find(|invocation| {
+            invocation.program == "lvs" && invocation.args.contains(&"-a".to_owned())
+        })
+        .expect("the foreign-move scan query");
+    assert_eq!(
+        scan.args,
+        vec![
+            "-a".to_owned(),
+            "--reportformat".to_owned(),
+            "json".to_owned(),
+            "--units".to_owned(),
+            "b".to_owned(),
+            "--nosuffix".to_owned(),
+            "-o".to_owned(),
+            "vg_name,lv_name,devices".to_owned(),
+        ],
+        "the hidden-mirror scan argv"
     );
 }
 
