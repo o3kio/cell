@@ -26,8 +26,9 @@ use volvisor_types::request::{
     MoveVolumeBackingRequest,
 };
 use volvisor_types::{
-    ApiError, CapabilitySet, ClaimDeviceRequest, DeviceId, FencingProof, MigrationId, ProjectId,
-    ReleaseDeviceRequest, VolumeId,
+    ApiError, CapabilitySet, ClaimDeviceRequest, DeviceId, FencingProof, LendDeviceRequest,
+    MigrationId, ProjectId, ReclaimDeviceRequest, ReleaseDeviceRequest, ResolveQuarantineRequest,
+    VolumeId,
 };
 
 use crate::error::{ApiErrorReply, json_response, text_response, to_json_value};
@@ -435,6 +436,154 @@ pub(crate) async fn release_device(
     )
     .await
     .map_err(ApiErrorReply::from)
+}
+
+/// The typed 404 for the lending routes on providers without a
+/// lending surface (the optional-surface pattern).
+fn lending_surface_unavailable() -> ApiError {
+    ApiError::not_found("lending surface not available for this provider")
+}
+
+/// `POST /v2/admin/devices/{device_id}/lend` — lend a claimed device
+/// to a borrower cell (P9-A, the rook-cell contract's lending
+/// surface).
+///
+/// Journaled exactly like claim (the Terminal replay class): the
+/// request hash folds in the borrower and the expected claim
+/// generation — a differing body under the same `operation_id` is a
+/// typed `IDEMPOTENCY_CONFLICT`. An in-doubt retry answers
+/// `OPERATION_IN_DOUBT` and never re-executes; the device-layer
+/// pending-intent journal owns the crash-window quarantine.
+pub(crate) async fn lend_device(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+    Path(device_id): Path<String>,
+    ValidJson(req): ValidJson<LendDeviceRequest>,
+) -> Result<Response, ApiErrorReply> {
+    // Route-level availability check first (see `claim_device`).
+    let lending = state
+        .lending
+        .clone()
+        .ok_or_else(|| ApiErrorReply(lending_surface_unavailable()))?;
+    req.validate()?;
+    let device_id = parse_device_id(&device_id)?;
+    tracing::info!(
+        kind = ops::OP_LEND_DEVICE,
+        operation_id = %req.operation_id,
+        device_id = %device_id,
+        borrower_cell_id = %req.borrower_cell_id,
+        "accepting lend_device"
+    );
+    let payload = ops::admin_payload(&device_id, &req)?;
+    ops::execute(
+        &state,
+        ops::OP_LEND_DEVICE,
+        req.operation_id.clone(),
+        req.request_hash(&device_id),
+        payload,
+        move || async move { lending.lend_device(&device_id, &req).await },
+    )
+    .await
+    .map_err(ApiErrorReply::from)
+}
+
+/// `POST /v2/admin/devices/{device_id}/reclaim` — reclaim a lent
+/// device: the borrower's release observed, or the operator-authorized
+/// force path with its recorded residue check (foreign residue
+/// quarantines, never a silent reuse).
+///
+/// Journaled like lend; the force path's `operator_authorization` is
+/// redacted from the journal payload and excluded from the request
+/// hash (a replay after token rotation resolves to the recorded
+/// outcome, by design).
+pub(crate) async fn reclaim_device(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+    Path(device_id): Path<String>,
+    ValidJson(req): ValidJson<ReclaimDeviceRequest>,
+) -> Result<Response, ApiErrorReply> {
+    let lending = state
+        .lending
+        .clone()
+        .ok_or_else(|| ApiErrorReply(lending_surface_unavailable()))?;
+    req.validate()?;
+    let device_id = parse_device_id(&device_id)?;
+    tracing::info!(
+        kind = ops::OP_RECLAIM_DEVICE,
+        operation_id = %req.operation_id,
+        device_id = %device_id,
+        forced = req.force.is_some(),
+        "accepting reclaim_device"
+    );
+    let payload = ops::admin_payload(&device_id, &req)?;
+    ops::execute(
+        &state,
+        ops::OP_RECLAIM_DEVICE,
+        req.operation_id.clone(),
+        req.request_hash(&device_id),
+        payload,
+        move || async move { lending.reclaim_device(&device_id, &req).await },
+    )
+    .await
+    .map_err(ApiErrorReply::from)
+}
+
+/// `POST /v2/admin/devices/{device_id}/resolve-quarantine` — the
+/// explicit operator action that exits a device's quarantine (the
+/// recorded P9-A decision): it reconciles a journaled-but-unapplied
+/// lend/reclaim intent by what the durable record proves, or records
+/// the operator's inspected-and-accepted resolution of foreign
+/// residue. An unreadable ownership record has no exit.
+pub(crate) async fn resolve_quarantine(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+    Path(device_id): Path<String>,
+    ValidJson(req): ValidJson<ResolveQuarantineRequest>,
+) -> Result<Response, ApiErrorReply> {
+    let lending = state
+        .lending
+        .clone()
+        .ok_or_else(|| ApiErrorReply(lending_surface_unavailable()))?;
+    req.validate()?;
+    let device_id = parse_device_id(&device_id)?;
+    tracing::info!(
+        kind = ops::OP_RESOLVE_QUARANTINE,
+        operation_id = %req.operation_id,
+        device_id = %device_id,
+        "accepting resolve_quarantine"
+    );
+    let payload = ops::admin_payload(&device_id, &req)?;
+    ops::execute(
+        &state,
+        ops::OP_RESOLVE_QUARANTINE,
+        req.operation_id.clone(),
+        req.request_hash(&device_id),
+        payload,
+        move || async move { lending.resolve_device_quarantine(&device_id, &req).await },
+    )
+    .await
+    .map_err(ApiErrorReply::from)
+}
+
+/// `GET /v2/admin/devices/{device_id}/ownership` — the operator-visible
+/// ownership answer: who holds the device, whether (and to whom) it is
+/// lent, and the quarantine state when one holds.
+///
+/// Read-only (no journaling, like device discovery): the observation
+/// never mutates anything.
+pub(crate) async fn device_ownership(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+    Path(device_id): Path<String>,
+) -> Result<Response, ApiErrorReply> {
+    let lending = state
+        .lending
+        .clone()
+        .ok_or_else(|| ApiErrorReply(lending_surface_unavailable()))?;
+    let device_id = parse_device_id(&device_id)?;
+    let ownership = lending.device_ownership(&device_id).await?;
+    let body = to_json_value(&ownership)?;
+    Ok(json_response(StatusCode::OK, &body))
 }
 
 /// `POST /v2/admin/nearline/{volume_id}/adopt` — the adopt-and-promote

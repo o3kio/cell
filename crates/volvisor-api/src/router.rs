@@ -60,6 +60,27 @@ pub fn router(state: SharedState, max_body_bytes: usize) -> Router {
             "/v2/admin/devices/{device_id}/release",
             post(handlers::release_device),
         )
+        // Device lending (P9-A, the rook-cell contract's lending
+        // surface): the lend/reclaim/resolve mutations and the
+        // read-only ownership answer, over claimed devices. Admin
+        // token required like every admin route; providers without a
+        // lending surface serve the typed 404.
+        .route(
+            "/v2/admin/devices/{device_id}/lend",
+            post(handlers::lend_device),
+        )
+        .route(
+            "/v2/admin/devices/{device_id}/reclaim",
+            post(handlers::reclaim_device),
+        )
+        .route(
+            "/v2/admin/devices/{device_id}/resolve-quarantine",
+            post(handlers::resolve_quarantine),
+        )
+        .route(
+            "/v2/admin/devices/{device_id}/ownership",
+            get(handlers::device_ownership),
+        )
         // Nearline unplanned failover (P4a plan §6): the adopt-and-promote
         // admin operation. Admin token required; providers without an
         // adoption surface serve the typed 404.
