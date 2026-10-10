@@ -5,8 +5,22 @@
 four bounded Tier V scenarios driven against live Cloud Hypervisor
 processes at commit `e8b092d` (PR #27). `records/` holds the run's
 own evidence records, unmodified; `REPORT.md` is the campaign summary
-rendered over the same run (`campaign-summary --all --check` exits 0
-over it — all five completion gates pass, CG1 names the commit).
+rendered over the same run.
+
+**What is checkable from this directory alone — and what is not.**
+The committed bundle's SHAPE is validated from any fresh checkout by
+the default suite: `crates/volvisor-campaign/tests/committed_evidence.rs`
+parses every committed record and asserts the invariants that make
+the bundle meaningful — tier, the outcome vocabulary, the version +
+SHA256 stamps, the expected scenario set, and this README's
+per-scenario table agreeing with the records (outcome and duration).
+The full certification (`campaign-summary --all --check`, all five
+completion gates) ran over the complete run TREE — 103 records
+including the Tier S/R matrix — which lives in the gitignored
+`target/campaign-evidence/`, not here: CG1 legitimately requires the
+full matrix, so a committed Tier V directory alone cannot and must
+not pass it. Reproducing the full certification means re-running the
+suite (see below).
 
 **What this host is — and is not.** A development sandbox with KVM
 (`/dev/kvm`), running the host's own kernel (`6.8.0-142-generic`) and
@@ -37,14 +51,14 @@ ttyS0 — the guest issues no disk I/O; the write workload is the rig's
 model through the simulated device, recorded in every run record).
 
 **Per-scenario outcomes** (the records are the authority; this is a
-reading):
+reading — the shape test pins this table to the records):
 
 | Scenario | Outcome | The real observation |
 |---|---|---|
-| `migration-happy-path` | complete (1351 ms) | the full protocol over two live VMMs; source VM destroyed, destination VM resumed — both observed over the api sockets; the real snapshot artifacts verified on disk |
-| `kill-window-mid-restore` | recovered (1710 ms) | the destination daemon died inside the cut's restore act; the kill leg observed the source already destroyed and the destination VM mid-flight (Running — the blocking restore+resume completed before the abort); the startup pass re-drove to COMPLETE with no double epoch |
-| `snapshot-restore-divergence` | complete (1402 ms) | 14 acknowledged writes byte-verified at the destination, the boundary at the REAL pause (stop reason `paused`, zero barrier skew), and both divergent restores refused typed (`InvalidState`) |
-| `resize-notification` | complete (73 ms) | both version-gate legs probed from the real binary; the notification took the `retry_required` branch (see the finding below) and the retry pass honestly re-reported it |
+| `migration-happy-path` | complete (1767 ms) | the full protocol over two live VMMs; source VM destroyed, destination VM resumed — both observed over the api sockets; the real snapshot artifacts verified on disk |
+| `kill-window-mid-restore` | recovered (1764 ms) | the destination daemon died inside the cut's restore act; the kill leg observed the source already destroyed and the destination VM mid-flight (Running — the blocking restore+resume completed before the abort); the startup pass re-drove to COMPLETE with no double epoch |
+| `snapshot-restore-divergence` | complete (1837 ms) | 14 acknowledged writes byte-verified at the destination, the boundary at the REAL pause (stop reason `paused`, zero barrier skew), and both divergent restores refused typed (`InvalidState`) |
+| `resize-notification` | complete (60 ms) | both version-gate legs probed from the real binary; the notification took the `retry_required` branch (see the finding below) and the retry pass honestly re-reported it |
 
 **Findings recorded by this run** (honest outcomes, not failures):
 
@@ -54,9 +68,11 @@ reading):
    contract both ways: a 2xx means `notified`; a typed refusal means
    a durable `retry_required` record carrying the refusal, the grow
    still completes, and the retry pass converges. The record names
-   the branch it observed. Adapting the scenario to a binary that
-   carries the route (and recording the notified leg on such a host)
-   is P8-B follow-up work.
+   the branch it observed. Re-running the scenario on a host whose
+   Cloud Hypervisor carries the route (upstream by v51.0.0), so the
+   `notified` leg is recorded from a real observation too, is a
+   recorded P8-A follow-up in the
+   [implementation plan](../../../plans/2026-10-10-post-p5-implementation-plan.md).
 2. **A live empty VMM's `info` answers HTTP 500 with the body "VM is
    not created"** — a not-found shape no doc-derived token matched,
    so the empty-restore-target steady state surfaced as a typed

@@ -336,6 +336,17 @@ Cloud Hypervisor installed) or the tier's not-run state is itself recorded
 and visible; the nearline §10 ledger's Tier V line moves from "planned" to
 the delivered truth, whatever it is.
 
+**Recorded follow-up (from the delivered run).** The first recorded host
+run's binary (cloud-hypervisor v43.0.0) predates the upstream
+`vm.resize-disk` API route, so the resize scenario's notified leg is
+asserted by contract only (a 2xx means `notified`; a typed refusal means a
+durable `retry_required` carrying it) and the run recorded the refusal
+branch (HTTP 404). Follow-up, still P8-A scope: re-run the resize scenario
+on a host whose Cloud Hypervisor carries the route (upstream by v51.0.0),
+recording that binary's version and SHA256 in the run record's components,
+so the `notified` leg is recorded from a real observation too. This is NOT
+P8-B work — P8-B is the engine-comparison methodology, a different scope.
+
 ### P8-B: the engine-comparison benchmark methodology and its decision gate
 
 **Scope.** The methodology for the §12 engine-comparison consideration
