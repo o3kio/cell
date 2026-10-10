@@ -30,17 +30,51 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # RUSTFLAGS does not reach rustdoc; the doc gate needs its own
+  # denial flag or pre-existing rustdoc warnings rot silently
+  # (review NIT-3).
+  RUSTDOCFLAGS: -D warnings
 
 permissions:
   contents: read
 
 jobs:
+  # The release-tag guard (review NIT-1): the `v*` glob accepts any
+  # v-prefixed tag, so the tag shape is validated before anything
+  # runs. package-version.sh refuses hyphen-bearing tags outright
+  # (review NIT-2: v0.1.0-rc1 would sanitize to 0.1.0+rc1, sorting
+  # AFTER the release); this guard additionally requires the mapped
+  # version to lead with a digit, so a `vtest` tag fails loudly
+  # before any build or publish attempt. On workflow_dispatch the
+  # tagless mapping (~g form) is digit-leading by construction and
+  # the guard passes.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate that this ref produces a release version
+        run: |
+          set -eu
+          version=$(./packaging/package-version.sh)
+          case "$version" in
+              [0-9]*) echo "guard: ref $GITHUB_REF maps to package version '$version'" ;;
+              *)
+                  echo "guard: ref '$GITHUB_REF' produces package version '$version'," >&2
+                  echo "which does not lead with a digit — not a valid release version." >&2
+                  echo "Release tags are v<semver> (e.g. v0.1.0); see packaging/README.md." >&2
+                  exit 1
+                  ;;
+          esac
+
   # The same gate set ci.yaml enforces per change (check + the LVM
   # feature surface), re-run for the exact release commit. This job
   # duplicates ci.yaml's steps deliberately: a release must not
   # depend on whichever CI run happened to precede the tag, and the
   # duplication is two short jobs against a fragile composite.
   gates:
+    needs: guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,14 +83,14 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo clippy -p volvisor-lvm --features integration-lvm --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo doc --no-deps --document-private-items
+      - run: cargo clippy --workspace --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked -p volvisor-lvm --features integration-lvm --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo doc --locked --no-deps --document-private-items
       - name: Real-LVM integration suite (ci.yaml parity)
         run: |
           sudo apt-get update && sudo apt-get install -y lvm2
-          sudo -E env "PATH=$PATH" VOLVISOR_TEST_LVM=1 cargo test -p volvisor-lvm --features integration-lvm
+          sudo -E env "PATH=$PATH" VOLVISOR_TEST_LVM=1 cargo test --locked -p volvisor-lvm --features integration-lvm
 
   # ADR-0009's release gate: the campaign certification for the exact
   # commit, over freshly emitted evidence — the suite re-emits the
@@ -64,6 +98,7 @@ jobs:
   # process exit code. The rendered record is embedded in the release
   # notes by the release job.
   certification:
+    needs: guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -73,8 +108,8 @@ jobs:
         run: |
           set -eu
           rm -rf target/campaign-evidence
-          cargo test -q --workspace
-          cargo run -q -p volvisor-campaign --bin campaign-summary -- --all --check
+          cargo test -q --workspace --locked
+          cargo run -q --locked -p volvisor-campaign --bin campaign-summary -- --all --check
       - name: Render the certification record
         run: |
           set -eu
@@ -113,7 +148,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build the release binaries (x86_64-unknown-linux-gnu)
-        run: cargo build --release -p volvisord --bins
+        run: cargo build --release --locked -p volvisord --bins
       - name: Assert the binary stamp and derive the package version
         id: stamp
         run: |
@@ -289,13 +324,20 @@ jobs:
             echo
             echo "The full campaign report:"
             echo
-            echo '<details><summary>certification-report.md</summary>'
+            # The report is embedded inside a fence strictly longer
+            # than any backtick run it contains, so a report with
+            # backticks cannot break out of the fence (review NIT-4).
+            run_len=$(awk '{ while (match($0, /`+/)) { if (RLENGTH > m) m = RLENGTH; $0 = substr($0, RSTART + RLENGTH) } } END { print m + 0 }' certification/certification-report.md)
+            fence_len=$(( run_len + 1 ))
+            if [ "$fence_len" -lt 3 ]; then fence_len=3; fi
+            fence=$(printf '%*s' "$fence_len" '' | tr ' ' '`')
+            echo "<details><summary>certification-report.md</summary>"
             echo
-            echo '```markdown'
+            echo "${fence}markdown"
             cat certification/certification-report.md
-            echo '```'
+            echo "$fence"
             echo
-            echo '</details>'
+            echo "</details>"
           } > dist/release-notes.md
       - name: Create the release (tag builds only)
         env:
