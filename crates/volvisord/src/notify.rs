@@ -38,10 +38,19 @@
 
 use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::path::Path;
+use std::time::Duration;
 
 /// The entire readiness message, per the protocol: one datagram,
 /// `READY=1\n`.
 const READY: &[u8] = b"READY=1\n";
+
+/// The write bound on the READY datagram: a service manager whose
+/// socket stopped draining (a full receiver queue) must not wedge the
+/// daemon's startup path. One second is far above any healthy
+/// journald-side drain and far below anything an operator would wait
+/// out; a timeout is contained exactly like a send failure (logged,
+/// never fatal).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// What a [`notify_ready`] attempt did.
 #[derive(Debug, PartialEq, Eq)]
@@ -126,12 +135,23 @@ fn abstract_socket_addr(spec: &str, _name: &str) -> Result<SocketAddr, NotifyErr
 /// Send the `READY=1` datagram to `spec`: one unbound UNIX datagram
 /// socket, connect, send — the sender needs no name of its own (the
 /// service manager only ever receives).
+///
+/// The send is bounded by [`WRITE_TIMEOUT`]: a service manager whose
+/// socket stopped draining must not wedge the daemon's startup path.
+/// A timeout surfaces as the same contained [`NotifyError::SendFailed`]
+/// as any send failure — logged, never fatal.
 fn send_ready(spec: &str) -> Result<(), NotifyError> {
     let addr = socket_addr(spec)?;
     let socket = UnixDatagram::unbound().map_err(|source| NotifyError::SendFailed {
         spec: spec.to_owned(),
         source,
     })?;
+    socket
+        .set_write_timeout(Some(WRITE_TIMEOUT))
+        .map_err(|source| NotifyError::SendFailed {
+            spec: spec.to_owned(),
+            source,
+        })?;
     socket
         .connect_addr(&addr)
         .and_then(|()| socket.send(READY).map(|_| ()))
@@ -284,6 +304,52 @@ mod tests {
         assert!(
             matches!(result, Err(NotifyError::SendFailed { .. })),
             "a dead notify socket is a typed send failure: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_wedged_notify_socket_times_out_contained() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("notify.sock");
+        // Underscore-named but alive: the bound socket owns the
+        // queue the fill loop fills — dropping it would unlink the
+        // path.
+        let _receiver = UnixDatagram::bind(&path).expect("bind the notify socket");
+        // The wedged-manager shape: a receiver that stopped draining.
+        // A unix datagram queue's blocking limit is its datagram
+        // *count*, and each sender's send-buffer allowance is its
+        // own — so one repeated sender stops on its own allowance
+        // long before the queue is full (verified against this
+        // kernel). Fresh non-blocking senders, one datagram each,
+        // fill the queue itself; the first EAGAIN is the limit.
+        let mut queued = 0;
+        while queued < 4000 {
+            let sender = UnixDatagram::unbound().expect("filler socket");
+            sender.set_nonblocking(true).expect("nonblocking filler");
+            if sender.send_to(b"x", &path).is_err() {
+                break;
+            }
+            queued += 1;
+        }
+        assert!(
+            queued > 0,
+            "the receiver queue must actually fill (queued {queued})"
+        );
+        // That send blocks on the full queue; the write bound fires
+        // and is contained exactly like any send failure.
+        let started = std::time::Instant::now();
+        let result = send_ready(path.to_str().expect("utf-8 tempdir path"));
+        assert!(
+            matches!(result, Err(NotifyError::SendFailed { .. })),
+            "a wedged socket is a typed send failure: {result:?}"
+        );
+        assert!(
+            started.elapsed() >= WRITE_TIMEOUT,
+            "the write bound fired, not an immediate error"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the write bound is actually bounded"
         );
     }
 
