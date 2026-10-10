@@ -502,13 +502,13 @@ asserts nothing the artifacts do not already carry.
 
 | Stage | PR(s) | Outcome | Evidence |
 |---|---|---|---|
-| P6-A hardening slice | #21–#23 | delivered | the flake fixes and the row-3 budget amendment (#21), the F1 lineage re-check (#22), the grant_set wedge fix — re-resolvable peer acts — with the campaign's rows 7–8 re-derived ([the diagnosis](2026-10-10-grant-set-wedge-diagnosis.md)) |
+| P6-A hardening slice | #21–#23 | delivered | the flake fixes and the row-3 budget amendment (#21), the F1 lineage re-check (#22), the grant_set wedge fix — re-resolvable peer acts — with the campaign's rows 7–8 re-derived ([the diagnosis](2026-10-10-grant-set-wedge-diagnosis.md); the healed cells' records in the campaign suite's `rows_8_14.rs` and `summary.rs`) |
 | P6-B grow-notification | #20 | delivered | the `vm.resize-disk` path with the pinned version gate and the real `guest_notification_status` machine (`volvisor-provider`'s `grow_tests.rs` + the byte-exact `vmm_tests.rs`) |
 | P6-C same-VG pvmove | #24 | delivered | `MoveVolumeBackingOnline` end to end: 33 provider-semantics tests (`volvisor-lvm`'s `move_tests.rs`), 5 daemon rows (`volvisord`'s `move_e2e.rs`), the campaign's row 16 (`move_rows.rs`), the `VOLVISOR_TEST_LVM=1` integration quartet |
 | P7-A version/config | #19 | delivered | `--version` / `--check-config` surfaces, [configuration.md](../configuration.md) + the `examples/` configs, asserted in CI |
 | P7-B units + readiness | #25 | delivered | `packaging/volvisord.service` + `volvisor-witnessd.service`: `Type=notify`, `READY=1` only after startup reconciliation, hardening with omissions documented |
 | P7-C packaging + release CI | #26 | delivered | `.github/workflows/release.yaml` + `packaging/smoke.sh`: deb and rpm built, installed and smoke-tested in containers |
-| P8-A Tier V | #27 | delivered | the env-gated substrate and four bounded scenarios (`volvisor-campaign`'s `tier_v`), and the first recorded host run committed at [docs/evidence/tier-v/2026-10-10-devhost/](../evidence/tier-v/2026-10-10-devhost/) |
+| P8-A Tier V | #27 | delivered | the env-gated substrate and four bounded scenarios (`volvisor-campaign`'s `tier_v`), and the first recorded host run committed at [docs/evidence/tier-v/2026-10-10-devhost/REPORT.md](../evidence/tier-v/2026-10-10-devhost/REPORT.md) |
 | P8-B engine-comparison gate | #28 | decided — gate closed | [the methodology](../benchmarks/engine-comparison-methodology.md) §7: no benchmark can honestly run in this phase, so no new engine is built; the gate reopens only by executing the methodology on matched hardware |
 | P8-C local-mirror experiment | #28 | decided — declined | [ADR-0011](../adr/0011-local-mirror-experiment-decline.md), with the reopenable sketch in its appendix |
 | P9-A lending surface | #29 | delivered | the contract's six lending invariants, one daemon-level Tier S test each (`volvisor-api`'s `lending_tests`), the contract's operator shape and the implementation agreeing |
