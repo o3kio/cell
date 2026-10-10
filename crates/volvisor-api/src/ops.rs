@@ -78,6 +78,15 @@ pub const OP_MOVE_VOLUME_BACKING: &str = "move_volume_backing";
 pub const OP_CLAIM_DEVICE: &str = "claim_device";
 /// Operation kind: release a claimed device (admin surface).
 pub const OP_RELEASE_DEVICE: &str = "release_device";
+/// Operation kind: lend a claimed device to a borrower cell (the
+/// lending surface, P9-A).
+pub const OP_LEND_DEVICE: &str = "lend_device";
+/// Operation kind: reclaim a lent device — observed release or the
+/// operator-authorized force path (the lending surface, P9-A).
+pub const OP_RECLAIM_DEVICE: &str = "reclaim_device";
+/// Operation kind: resolve a device quarantine — the explicit
+/// operator exit (the lending surface, P9-A).
+pub const OP_RESOLVE_QUARANTINE: &str = "resolve_quarantine";
 /// Operation kind: adopt-and-promote a nearline volume (admin surface).
 pub const OP_ADOPT_VOLUME: &str = "adopt_volume";
 /// Operation kind: clear a stale migration-cut marker (admin surface).
@@ -104,7 +113,7 @@ pub const OP_PEER_DISCARD: &str = "peer_discard";
 /// either a matrix cell drives the kind, or the kind appears in the
 /// campaign's recorded-gaps table with its reason (never a silent
 /// cut).
-pub const ALL_OP_KINDS: [&str; 17] = [
+pub const ALL_OP_KINDS: [&str; 20] = [
     OP_CREATE_VOLUME,
     OP_ATTACH_VOLUME,
     OP_DETACH_VOLUME,
@@ -113,6 +122,9 @@ pub const ALL_OP_KINDS: [&str; 17] = [
     OP_MOVE_VOLUME_BACKING,
     OP_CLAIM_DEVICE,
     OP_RELEASE_DEVICE,
+    OP_LEND_DEVICE,
+    OP_RECLAIM_DEVICE,
+    OP_RESOLVE_QUARANTINE,
     OP_ADOPT_VOLUME,
     OP_CLEAR_CUT_MARKER,
     OP_MIGRATION_PREPARE,
@@ -131,9 +143,10 @@ pub const ALL_OP_KINDS: [&str; 17] = [
 
 /// Object keys whose *string* values are credential references and are
 /// replaced with [`REDACTED`] before any payload is journaled.
-const REDACTED_KEYS: [&str; 4] = [
+const REDACTED_KEYS: [&str; 5] = [
     "key_ref",
     "authorization_token",
+    "operator_authorization",
     "witness_host_token",
     "peer_api_token",
 ];
@@ -144,10 +157,12 @@ const REDACTED: &str = "[redacted]";
 /// Recursively redact credential material from a journal payload.
 ///
 /// Walks the payload and replaces the string value of any object key named
-/// `key_ref` (external secret references) or `authorization_token` (scoped
-/// destructive-authorization tokens) with `[redacted]`, at any nesting
-/// depth and inside arrays. Volume/attachment/device identities, sizes and
-/// policies are not credentials and remain intact for forensics.
+/// `key_ref` (external secret references), `authorization_token` (scoped
+/// destructive-authorization tokens) or `operator_authorization` (the
+/// lending surface's force/resolve operator tokens) with `[redacted]`, at
+/// any nesting depth and inside arrays. Volume/attachment/device
+/// identities, sizes and policies are not credentials and remain intact
+/// for forensics.
 ///
 /// The *request hash* is computed from the typed request before redaction
 /// (the hashes in `volvisor-types` deliberately exclude token material), so

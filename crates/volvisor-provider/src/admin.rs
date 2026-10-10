@@ -103,6 +103,23 @@ pub(crate) const FAKE_DEVICE_ID: &str = "dev-fake-1";
 pub(crate) const FAKE_DEVICE_BYTES: u64 = 1 << 40;
 
 pub(crate) fn fake_device(claimed: bool) -> Result<PhysicalDevice, ApiError> {
+    fake_device_at(
+        claimed,
+        if claimed {
+            Generation(1)
+        } else {
+            Generation(0)
+        },
+    )
+}
+
+/// The discovery view at an explicit claim generation (the durable
+/// device world's real generation, which advances with every
+/// claim/release cycle).
+pub(crate) fn fake_device_at(
+    claimed: bool,
+    generation: Generation,
+) -> Result<PhysicalDevice, ApiError> {
     Ok(PhysicalDevice {
         id: DeviceId::new(FAKE_DEVICE_ID)?,
         host_id: volvisor_types::HostId::new("fake-host-1")?,
@@ -110,11 +127,7 @@ pub(crate) fn fake_device(claimed: bool) -> Result<PhysicalDevice, ApiError> {
         capacity_bytes: FAKE_DEVICE_BYTES,
         health: Health::Unknown,
         owner_role: claimed.then_some(DeviceRole::NativePool),
-        owner_generation: if claimed {
-            Generation(1)
-        } else {
-            Generation(0)
-        },
+        owner_generation: generation,
     })
 }
 
@@ -134,9 +147,18 @@ pub(crate) fn fake_pool() -> Result<Pool, ApiError> {
 #[async_trait]
 impl AdminSurface for crate::FakeProvider {
     async fn discover_devices(&self) -> Result<DeviceListResponse, ApiError> {
-        let claimed = self.admin_device_claimed().await;
+        // The durable mode answers from the ownership record (the
+        // record is the authority); the legacy mode from the
+        // in-memory flag.
+        let device = match &self.devices {
+            Some(world) => {
+                let (claimed, generation) = world.claim_state(&DeviceId::new(FAKE_DEVICE_ID)?)?;
+                fake_device_at(claimed, generation)?
+            }
+            None => fake_device(self.admin_device_claimed().await)?,
+        };
         Ok(DeviceListResponse {
-            devices: vec![fake_device(claimed)?],
+            devices: vec![device],
         })
     }
 
@@ -149,13 +171,19 @@ impl AdminSurface for crate::FakeProvider {
         if device_id.as_str() != FAKE_DEVICE_ID {
             return Err(ApiError::not_found(format!("unknown device {device_id}")));
         }
-        if self.admin_device_claimed().await {
-            return Err(ApiError::new(
-                ApiErrorCode::InvalidState,
-                "device is already claimed",
-            ));
+        if let Some(world) = &self.devices {
+            // The durable claim: freeze checks (quarantine, live lend),
+            // then the next claim generation of the one record.
+            world.claim(device_id)?;
+        } else {
+            if self.admin_device_claimed().await {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    "device is already claimed",
+                ));
+            }
+            self.set_admin_device_claimed(true).await;
         }
-        self.set_admin_device_claimed(true).await;
         fake_pool()
     }
 
@@ -167,6 +195,13 @@ impl AdminSurface for crate::FakeProvider {
         request.validate()?;
         if device_id.as_str() != FAKE_DEVICE_ID {
             return Err(ApiError::not_found(format!("unknown device {device_id}")));
+        }
+        if let Some(world) = &self.devices {
+            // The durable release: the same freeze checks (a lent or
+            // quarantined device is never released), then the next
+            // generation of the one record.
+            world.release(device_id)?;
+            return Ok(());
         }
         if !self.admin_device_claimed().await {
             return Err(ApiError::new(
@@ -188,6 +223,62 @@ impl AdminSurface for crate::FakeProvider {
         self.set_admin_device_claimed(false).await;
         Ok(())
     }
+}
+
+#[async_trait]
+impl crate::lending::LendingSurface for crate::FakeProvider {
+    async fn lend_device(
+        &self,
+        device_id: &DeviceId,
+        request: &volvisor_types::LendDeviceRequest,
+    ) -> Result<volvisor_types::DeviceOwnershipResponse, ApiError> {
+        let world = self
+            .devices
+            .as_ref()
+            .ok_or_else(lending_surface_unavailable)?;
+        world.lend(device_id, request)
+    }
+
+    async fn reclaim_device(
+        &self,
+        device_id: &DeviceId,
+        request: &volvisor_types::ReclaimDeviceRequest,
+    ) -> Result<volvisor_types::ReclaimDeviceAck, ApiError> {
+        let world = self
+            .devices
+            .as_ref()
+            .ok_or_else(lending_surface_unavailable)?;
+        world.reclaim(device_id, request)
+    }
+
+    async fn resolve_device_quarantine(
+        &self,
+        device_id: &DeviceId,
+        request: &volvisor_types::ResolveQuarantineRequest,
+    ) -> Result<volvisor_types::DeviceOwnershipResponse, ApiError> {
+        let world = self
+            .devices
+            .as_ref()
+            .ok_or_else(lending_surface_unavailable)?;
+        world.resolve_quarantine(device_id, request)
+    }
+
+    async fn device_ownership(
+        &self,
+        device_id: &DeviceId,
+    ) -> Result<volvisor_types::DeviceOwnershipResponse, ApiError> {
+        let world = self
+            .devices
+            .as_ref()
+            .ok_or_else(lending_surface_unavailable)?;
+        world.ownership(device_id)
+    }
+}
+
+/// The typed 404 for the lending routes on providers without the
+/// durable device world (the optional-surface pattern).
+fn lending_surface_unavailable() -> ApiError {
+    ApiError::not_found("lending surface not available for this provider")
 }
 
 #[cfg(test)]

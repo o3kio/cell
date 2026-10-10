@@ -5,7 +5,7 @@ use std::sync::Arc;
 use volvisor_handoff::MigrationSurface;
 use volvisor_journal::Journal;
 use volvisor_provider::{
-    AdminSurface, AdoptionSurface, GrowNotifier, HandoffSurface, VolumeProvider,
+    AdminSurface, AdoptionSurface, GrowNotifier, HandoffSurface, LendingSurface, VolumeProvider,
 };
 
 use crate::metrics::Metrics;
@@ -30,6 +30,11 @@ pub struct AppState {
     /// Privileged device-enrollment surface, when the provider implements
     /// one. `None` serves `404` on the `/v2/admin` routes.
     pub(crate) admin: Option<Arc<dyn AdminSurface>>,
+    /// Device-lending surface (P9-A, the rook-cell contract's lending
+    /// operations), when the provider implements one over durable
+    /// ownership records. `None` serves the typed 404 on the lending
+    /// routes.
+    pub(crate) lending: Option<Arc<dyn LendingSurface>>,
     /// Nearline adopt-and-promote surface (P4a), when the provider
     /// implements one. `None` serves the typed 404 on the adopt route.
     pub(crate) adoption: Option<Arc<dyn AdoptionSurface>>,
@@ -91,6 +96,7 @@ impl AppState {
         Self {
             provider,
             admin,
+            lending: None,
             adoption: None,
             handoff: None,
             migration: None,
@@ -113,6 +119,19 @@ impl AppState {
     #[must_use]
     pub fn with_crash_hooks(mut self, crash: Arc<crate::crash::CrashHooks>) -> Self {
         self.crash = Some(crash);
+        self
+    }
+
+    /// Attach the device-lending surface (P9-A, the rook-cell
+    /// contract's lending operations over claimed devices): the
+    /// provider must also be the admin provider of this state — the
+    /// lending routes operate on the same durable ownership records
+    /// the claim/release routes drive. A state built without this
+    /// builder serves the typed 404 on the lending routes (the
+    /// optional-surface pattern).
+    #[must_use]
+    pub fn with_lending(mut self, lending: Arc<dyn LendingSurface>) -> Self {
+        self.lending = Some(lending);
         self
     }
 

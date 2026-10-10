@@ -53,6 +53,7 @@ pub mod conformance;
 pub mod fake;
 pub mod grow;
 pub mod handoff;
+pub mod lending;
 pub mod provider;
 pub mod runner;
 pub mod vmm;
@@ -67,6 +68,10 @@ pub use grow::{
 };
 pub use handoff::{
     EligibilityParticipant, EligibilityReport, HandoffSurface, QuiesceProof, SyncProof,
+};
+pub use lending::{
+    DeviceOwnershipRecord, DeviceOwnershipStore, DeviceSurfaceObserver, FakeDeviceWorld,
+    LendingSurface, ModeledDeviceSurface, PendingIntent,
 };
 pub use provider::VolumeProvider;
 pub use runner::{CommandOutput, CommandRunner, FakeRunner, Invocation, RealRunner};

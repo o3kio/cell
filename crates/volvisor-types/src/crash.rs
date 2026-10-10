@@ -92,6 +92,13 @@ pub const STORE_GROW_NOTIFICATIONS: &str = "grow_notifications";
 /// online same-VG move's PREPARING/COPYING/COMPLETE/IN_DOUBT
 /// record saves are armed through this seam).
 pub const STORE_LVM_STATE: &str = "lvm_state";
+/// See [`STORE_MIGRATION_RECORDS`]: the device-ownership record
+/// file of the lending surface (P9-A: the lend/reclaim
+/// pending-intent journal and the ownership-record effect saves
+/// are armed through this seam — the crash window between a
+/// journaled intent and its effect is what quarantines the
+/// device).
+pub const STORE_DEVICE_OWNERSHIP: &str = "device_ownership";
 
 /// One deterministic kill point inside a durable save (P5 plan
 /// §3.1).

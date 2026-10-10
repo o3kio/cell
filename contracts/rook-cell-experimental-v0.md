@@ -18,9 +18,12 @@ Sharing a volvisor-claimed device with a cell (Rook) is an **explicit lending op
 LendDevice(device_id, borrower_cell_id, expected_claim_generation, operation_id)
 ReclaimDevice(device_id, expected_lend_generation, operation_id,
               force?{ operator_authorization, residue_check })
+ResolveQuarantine(device_id, operator_authorization,
+                  residue_acknowledgement?, operation_id)
 DeviceOwnership(device_id)
-  -> { claimed_by: volvisor, claim_generation,
-       lent?: { borrower_cell_id, lend_generation, recorded_at, evidence_ref? } }
+  -> { claimed_by: volvisor | unclaimed | unknown, claim_generation,
+       lent?: { borrower_cell_id, lend_generation, recorded_at, evidence_ref? },
+       quarantined?: { reason, recorded_at } }
 ```
 
 Invariants (each one is POC evidence, below):
@@ -30,7 +33,7 @@ Invariants (each one is POC evidence, below):
 - **The lent state is operator-visible**: `DeviceOwnership` answers, typed, who holds the device and whether (and to whom) any of it is lent.
 - **A lent device is frozen for volvisor mutations**: destructive role changes, reformat, re-claim and a second lend are typed refusals while a lend is live (`WRITER_ALREADY_ACTIVE`-class semantics at the device layer; the refusal names the live lend).
 - **Reclaim needs a release or a recorded force**: the borrower must have released the device (cell teardown observed), or the operator-authorized force path runs — whose record carries a **residue check** (the device's observed state inspected and recorded; foreign residue quarantines the device, never silently reuses it). Force reclaim is an explicit recorded operation, not a cleanup shortcut.
-- **Unknown state fails closed** everywhere in the surface: a device whose lending state cannot be determined is not lent, reclaimed or mutated; it is quarantined pending reconciliation.
+- **Unknown state fails closed** everywhere in the surface: a device whose lending state cannot be determined is not lent, reclaimed or mutated; it is quarantined pending reconciliation — and the exit from quarantine is itself an explicit operation: `ResolveQuarantine` is operator-authorized and journaled, reconciles a journaled intent by what the durable record proves, and ends a foreign-residue tenure only when the operator acknowledges or re-inspects the recorded residue (`residue_acknowledgement`) — never a silent residue→clean conversion, and foreign residue handling is unchanged (it quarantines, it is never reused). P9-A delivered this exit; the contract names it.
 
 These invariants are what keep AGENTS rules 7 and 19 true while a cell guest holds the device. Nothing here authorizes production Rook support (ADR-0008's gate wording); the surface exists so the POC can *prove* sharing rather than assume it.
 

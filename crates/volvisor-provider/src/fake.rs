@@ -72,6 +72,11 @@ pub struct FakeProvider {
     supported_classes: Vec<VolumeClass>,
     capacity_bytes: u64,
     state: tokio::sync::Mutex<FakeState>,
+    /// The durable device-ownership world (the lending surface), when
+    /// constructed over a state file. `None` — the default, every
+    /// existing use — keeps the legacy in-memory admin claim and no
+    /// lending surface (the routes' typed 404).
+    pub(crate) devices: Option<std::sync::Arc<crate::lending::FakeDeviceWorld>>,
 }
 
 impl FakeProvider {
@@ -86,6 +91,7 @@ impl FakeProvider {
             supported_classes: vec![VolumeClass::NativeLocal],
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
             state: tokio::sync::Mutex::new(FakeState::default()),
+            devices: None,
         }
     }
 
@@ -110,6 +116,41 @@ impl FakeProvider {
     pub fn with_capacity_bytes(mut self, capacity_bytes: u64) -> Self {
         self.capacity_bytes = capacity_bytes;
         self
+    }
+
+    /// Construct with the durable device-ownership world: the lending
+    /// surface (P9-A). The fake's admin claim/release then route
+    /// through the durable ownership record — one record whose
+    /// generations are the claim, the lend and the reclaim — and
+    /// `LendDevice` / `ReclaimDevice` / `ResolveQuarantine` /
+    /// `DeviceOwnership` are served over it. The world survives daemon
+    /// restarts by construction (the state file), which is what makes
+    /// the lend/reclaim crash windows provable at the daemon level.
+    ///
+    /// `operator_token`, when `Some`, is the scoped
+    /// operator-authorization the force and resolve paths compare
+    /// against (the two-token model; see the `lending` module docs).
+    /// `None` compares nothing — the loopback/test shape.
+    #[must_use]
+    pub fn with_durable_devices(
+        mut self,
+        state_path: std::path::PathBuf,
+        store_crash: std::sync::Arc<volvisor_types::crash::StoreCrashHooks>,
+        operator_token: Option<String>,
+    ) -> Self {
+        self.devices = Some(std::sync::Arc::new(crate::lending::FakeDeviceWorld::open(
+            state_path,
+            store_crash,
+            operator_token,
+        )));
+        self
+    }
+
+    /// The durable device-ownership world, when constructed with one
+    /// (the lending surface and its testkit controls).
+    #[must_use]
+    pub fn durable_devices(&self) -> Option<std::sync::Arc<crate::lending::FakeDeviceWorld>> {
+        self.devices.clone()
     }
 
     /// Fault injection: the next mutation attempt fails with `failure`
