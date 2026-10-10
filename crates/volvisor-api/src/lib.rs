@@ -18,6 +18,10 @@
 //! | `GET /v2/admin/devices` | device discovery (admin surface; admin token required) |
 //! | `POST /v2/admin/devices/{device_id}/claim` | claim a device for a pool (admin surface) |
 //! | `POST /v2/admin/devices/{device_id}/release` | release a claimed device (admin surface) |
+//! | `POST /v2/admin/devices/{device_id}/lend` | lend a claimed device to a borrower cell (lending surface, P9-A) |
+//! | `POST /v2/admin/devices/{device_id}/reclaim` | reclaim a lent device — observed release or authorized force (lending surface, P9-A) |
+//! | `POST /v2/admin/devices/{device_id}/resolve-quarantine` | the explicit quarantine exit (lending surface, P9-A) |
+//! | `GET /v2/admin/devices/{device_id}/ownership` | the operator-visible ownership answer (lending surface, P9-A) |
 //! | `POST /v2/vms/{vm_id}/check-mobility` | `CheckVmStorageMobility` (read-only; admin token required) |
 //! | `POST /v2/migrations` | `PrepareNearlineHandoff` — answers `201`, idempotent by `migration_id` |
 //! | `POST /v2/migrations/{migration_id}/transfer` | `BarrierAndTransfer` — answers `202`; the proof is recorded as corroboration |
@@ -107,6 +111,8 @@ pub mod crash;
 mod error;
 mod extract;
 mod handlers;
+#[cfg(test)]
+mod lending_tests;
 mod metrics;
 mod ops;
 /// The internal peer routes (destination host; stage B2).
@@ -130,8 +136,9 @@ pub use state::{AppState, SharedState};
 pub mod op_kinds {
     pub use crate::ops::{
         ALL_OP_KINDS, OP_ADOPT_VOLUME, OP_ATTACH_VOLUME, OP_CLAIM_DEVICE, OP_CLEAR_CUT_MARKER,
-        OP_CREATE_VOLUME, OP_DELETE_VOLUME, OP_DETACH_VOLUME, OP_GROW_VOLUME, OP_MIGRATION_ABORT,
-        OP_MIGRATION_PREPARE, OP_MIGRATION_TRANSFER, OP_MOVE_VOLUME_BACKING, OP_PEER_DISCARD,
-        OP_PEER_GRANT, OP_PEER_PREPARE, OP_PEER_RESTORE_VM, OP_RELEASE_DEVICE,
+        OP_CREATE_VOLUME, OP_DELETE_VOLUME, OP_DETACH_VOLUME, OP_GROW_VOLUME, OP_LEND_DEVICE,
+        OP_MIGRATION_ABORT, OP_MIGRATION_PREPARE, OP_MIGRATION_TRANSFER, OP_MOVE_VOLUME_BACKING,
+        OP_PEER_DISCARD, OP_PEER_GRANT, OP_PEER_PREPARE, OP_PEER_RESTORE_VM, OP_RECLAIM_DEVICE,
+        OP_RELEASE_DEVICE, OP_RESOLVE_QUARANTINE,
     };
 }

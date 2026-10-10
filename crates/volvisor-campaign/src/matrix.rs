@@ -311,7 +311,15 @@ pub struct Gap {
 /// `MOVE_UNSUPPORTED_SCOPE` there), so the move's own durable
 /// boundaries — the `LvmState` move-record saves — are carried by
 /// §9 row 16 (this crate's `move_rows` binary, the LVM sibling
-/// surface) instead of a matrix cell.
+/// surface) instead of a matrix cell. The last three are the P9-A
+/// lending surface: the rig's DRBD provider has no lending surface
+/// (the routes answer the typed 404 there), so no matrix cell can
+/// drive them; the surface's own fault discipline — every lending
+/// invariant, the crash windows between the ownership-record
+/// journal and its effect, the force/residue paths — is carried by
+/// volvisor-api's lending test module (the daemon-level Tier S
+/// suite over the durable fake, the same sibling-fault-row
+/// discipline move_rows established).
 #[must_use]
 pub fn recorded_gaps() -> Vec<Gap> {
     vec![
@@ -326,6 +334,34 @@ pub fn recorded_gaps() -> Vec<Gap> {
             reason: "admin device-enrollment surface: off the nearline handoff path (plan \
                      §1 scope); same journaled pipeline and state-save seam the five driven \
                      volume kinds prove",
+        },
+        Gap {
+            op: op_kinds::OP_LEND_DEVICE,
+            reason: "P9-A lending surface: the rig's DRBD provider has no lending surface \
+                     (the route answers the typed 404), and the surface is off the nearline \
+                     handoff path (plan §1 scope); its journal pipeline is the same \
+                     ops::execute the volume-mutation family proves, and its own fault \
+                     discipline (the six contract invariants, the pending-intent crash \
+                     windows) is carried by volvisor-api's lending Tier S test module",
+        },
+        Gap {
+            op: op_kinds::OP_RECLAIM_DEVICE,
+            reason: "P9-A lending surface: the rig's DRBD provider has no lending surface \
+                     (the route answers the typed 404), and the surface is off the nearline \
+                     handoff path (plan §1 scope); its journal pipeline is the same \
+                     ops::execute the volume-mutation family proves, and its own fault \
+                     discipline (the release/force paths with the recorded residue check, \
+                     foreign-residue quarantine) is carried by volvisor-api's lending \
+                     Tier S test module",
+        },
+        Gap {
+            op: op_kinds::OP_RESOLVE_QUARANTINE,
+            reason: "P9-A lending surface: the rig's DRBD provider has no lending surface \
+                     (the route answers the typed 404), and the surface is off the nearline \
+                     handoff path (plan §1 scope); its journal pipeline is the same \
+                     ops::execute the volume-mutation family proves, and the quarantine \
+                     exit's reconciliation shapes are carried by volvisor-api's lending \
+                     Tier S test module",
         },
         Gap {
             op: op_kinds::OP_ADOPT_VOLUME,
