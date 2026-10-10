@@ -38,6 +38,13 @@
 //! | 4. A lent (or quarantined) device is frozen for volvisor mutations, typed refusals naming the live lend | `invariant_4_*` |
 //! | 5. Reclaim needs an observed release or an operator-authorized force with a recorded residue check; foreign residue quarantines | `invariant_5_*` |
 //! | 6. Unknown state fails closed: crash windows quarantine; unreadable records quarantine with no automated exit | `invariant_6_*` (four windows) |
+//!
+//! Beyond the invariants: the foreign-residue exit requires the
+//! operator's explicit `residue_acknowledgement` (pinned inside
+//! `invariant_5_*` — the conversion is never silent), and the store's
+//! **save-failure** windows (the error flavor the crash seams' kills
+//! do not model) refuse typed and serve durable truth —
+//! `a_failed_intent_save_*` and `a_failed_effect_save_*`.
 
 // Test bodies favor linear readability over clippy's size heuristics.
 #![allow(clippy::too_many_lines)]
@@ -321,6 +328,27 @@ impl LendingRig {
                 "api_version": "volvisor.volume.v2",
                 "operation_id": op,
                 "operator_authorization": operator_authorization,
+            }),
+        )
+        .await
+    }
+
+    /// The resolve carrying the operator's explicit residue
+    /// acknowledgement — the wire act of the foreign-residue exit
+    /// (the contract's `residue_acknowledgement`).
+    async fn resolve_acknowledged(
+        &self,
+        op: &str,
+        operator_authorization: &str,
+    ) -> (StatusCode, Value) {
+        self.send(
+            Method::POST,
+            &format!("/v2/admin/devices/{DEVICE}/resolve-quarantine"),
+            &json!({
+                "api_version": "volvisor.volume.v2",
+                "operation_id": op,
+                "operator_authorization": operator_authorization,
+                "residue_acknowledgement": "inspected_and_accepted",
             }),
         )
         .await
@@ -848,11 +876,24 @@ async fn invariant_5_reclaim_requires_an_observed_release_or_authorized_force() 
     // and the wrong token does not get it.
     let (status, refusal) = rig.resolve("op-resolve-1", "wrong-token").await;
     assert_refusal(&refusal, status, "UNSUPPORTED_CLASS_OR_POLICY");
-    let (status, resolved) = rig.resolve("op-resolve-2", OPERATOR_TOKEN).await;
+    // The right token without the explicit residue acknowledgement is
+    // still refused: the residue→clean conversion is never silent
+    // (the contract's `residue_acknowledgement`).
+    let (status, refusal) = rig.resolve("op-resolve-2", OPERATOR_TOKEN).await;
+    assert_refusal(&refusal, status, "INVALID_STATE");
+    assert!(
+        refusal["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("residue acknowledgement")),
+        "the refusal must name the missing acknowledgement: {refusal}"
+    );
+    let (status, resolved) = rig
+        .resolve_acknowledged("op-resolve-3", OPERATOR_TOKEN)
+        .await;
     assert_eq!(
         status,
         StatusCode::OK,
-        "the resolution must succeed: {resolved}"
+        "the acknowledged resolution must succeed: {resolved}"
     );
     assert_eq!(resolved["lend"], json!(null), "the borrower's tenure ends");
     assert_eq!(resolved["quarantined"], json!(null));
@@ -880,7 +921,9 @@ async fn invariant_5_reclaim_requires_an_observed_release_or_authorized_force() 
         ownership["quarantined"]["reason"]["kind"],
         json!("foreign_residue")
     );
-    let (status, _) = rig.resolve("op-resolve-3", OPERATOR_TOKEN).await;
+    let (status, _) = rig
+        .resolve_acknowledged("op-resolve-4", OPERATOR_TOKEN)
+        .await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -1103,7 +1146,9 @@ async fn invariant_6_crash_between_the_reclaim_journal_and_its_effect_fails_clos
         resolved["lend"].is_object(),
         "the tenure has not ended by reconciliation alone"
     );
-    let (status, accepted) = rig.resolve("op-resolve-3", OPERATOR_TOKEN).await;
+    let (status, accepted) = rig
+        .resolve_acknowledged("op-resolve-3", OPERATOR_TOKEN)
+        .await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -1272,6 +1317,95 @@ async fn an_observation_failure_refuses_without_writing_anything() {
     let (status, ack) = rig.reclaim("op-reclaim-2", lend_generation).await;
     assert_eq!(status, StatusCode::OK, "the reclaim must complete: {ack}");
     assert_eq!(ack["observation"]["observed"]["kind"], json!("released"));
+}
+
+// ------------------------------------------------------------------
+// The store's save-failure windows (the error flavor)
+// ------------------------------------------------------------------
+
+/// **A save that fails (not crashes)**: the caller is refused typed —
+/// the mutation is not acknowledged — and the served state is the
+/// **durable truth**: the pending intent the failed intent-save
+/// tried to journal never existed, so there is no phantom quarantine
+/// and no phantom lend. The corrected attempt (a fresh
+/// `operation_id`; the refusal was Terminal) proceeds — the world is
+/// not poisoned, exactly like the claiming layer's per-operation
+/// state discipline.
+#[tokio::test]
+async fn a_failed_intent_save_refuses_typed_and_serves_durable_truth() {
+    let mut rig = LendingRig::new();
+    rig.start();
+    let claim_generation = claimed(&rig).await;
+
+    // Arm the error seam: the very next save fails, once.
+    rig.world().fail_saves_after(0);
+    let (status, refusal) = rig.lend("op-lend-1", CELL_A, claim_generation).await;
+    assert_refusal(&refusal, status, "INTERNAL");
+
+    // The served state is what is durable: claimed, unlent, and NOT
+    // quarantined — the un-journaled pending intent is not served.
+    let (status, ownership) = rig.ownership().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ownership["claimed_by"], json!("volvisor"));
+    assert_eq!(ownership["lend"], json!(null));
+    assert_eq!(ownership["quarantined"], json!(null));
+
+    // The seam is one-shot: the corrected attempt proceeds.
+    let (status, _) = rig.lend("op-lend-2", CELL_A, claim_generation).await;
+    assert_eq!(status, StatusCode::OK, "the retried lend must proceed");
+    let (status, ownership) = rig.ownership().await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ownership["lend"].is_object(), "the lend is live now");
+}
+
+/// **A failed effect save**: the intent save landed, the effect save
+/// failed. The caller is refused typed, and the served state honors
+/// the *journaled* intent — unlent-but-quarantined on the unresolved
+/// lend intent, never the un-journaled lend — the same fail-closed
+/// answer the crash window gives. The explicit reconciliation is the
+/// exit, and the corrected lend proceeds afterwards.
+#[tokio::test]
+async fn a_failed_effect_save_serves_the_journaled_intent_never_the_lend() {
+    let mut rig = LendingRig::new();
+    rig.start();
+    let claim_generation = claimed(&rig).await;
+
+    // Arm the error seam: one save proceeds (the intent), the next
+    // fails (the effect), once.
+    rig.world().fail_saves_after(1);
+    let (status, refusal) = rig.lend("op-lend-1", CELL_A, claim_generation).await;
+    assert_refusal(&refusal, status, "INTERNAL");
+
+    // The journaled intent is durable truth: the failed lend is not
+    // served, and the pending intent derives the quarantine.
+    let (status, ownership) = rig.ownership().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        ownership["lend"],
+        json!(null),
+        "the un-journaled lend must not be served"
+    );
+    assert_eq!(
+        ownership["quarantined"]["reason"]["kind"],
+        json!("unresolved_lend_intent")
+    );
+    assert_eq!(
+        ownership["quarantined"]["reason"]["operation_id"],
+        json!("op-lend-1")
+    );
+
+    // The exit is the explicit reconciliation (record proof, no
+    // judgment), and the corrected lend proceeds.
+    let (status, resolved) = rig.resolve("op-resolve-1", OPERATOR_TOKEN).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the reconciliation must succeed: {resolved}"
+    );
+    assert_eq!(resolved["lend"], json!(null));
+    assert_eq!(resolved["quarantined"], json!(null));
+    let (status, _) = rig.lend("op-lend-2", CELL_A, claim_generation).await;
+    assert_eq!(status, StatusCode::OK, "the corrected lend must proceed");
 }
 
 // ------------------------------------------------------------------

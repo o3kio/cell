@@ -104,6 +104,29 @@ fn app(state: &SharedState) -> Router {
     router(state.clone(), ApiConfig::default().max_body_bytes)
 }
 
+/// State with the lending routes wired over the plain fake: the
+/// lending ops journal their intents through the shared pipeline,
+/// then the provider (which has no durable device world) answers its
+/// typed 404 — the shape the journal-redaction e2e needs, since the
+/// payload is journaled whatever the provider afterwards answers.
+fn setup_with_lending() -> (SharedState, Arc<FakeProvider>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let journal = Journal::open(dir.path()).expect("journal open");
+    let provider = Arc::new(FakeProvider::new());
+    let admin: Arc<dyn volvisor_provider::AdminSurface> = provider.clone();
+    let lending: Arc<dyn volvisor_provider::LendingSurface> = provider.clone();
+    let state = Arc::new(
+        AppState::new(
+            provider.clone(),
+            Some(admin),
+            journal,
+            Some(TEST_TOKEN.to_owned()),
+        )
+        .with_lending(lending),
+    );
+    (state, provider, dir)
+}
+
 fn request(method: Method, uri: &str) -> Request<Body> {
     Request::builder()
         .method(method)
@@ -1242,10 +1265,13 @@ fn redaction_replaces_credential_material_at_any_depth() {
 }
 
 /// End-to-end: the secrets from the wire requests never reach the journal
-/// file; the redaction marker does.
+/// file; the redaction marker does. Covers all three credential families —
+/// the volume surface's `key_ref`, the admin surface's
+/// `authorization_token`, and the lending surface's (force-reclaim)
+/// `operator_authorization`, nested inside the force directive.
 #[tokio::test]
 async fn journaled_intents_redact_secrets() {
-    let (state, _provider, dir) = setup();
+    let (state, _provider, dir) = setup_with_lending();
     let app = app(&state);
 
     // A create carrying an encryption key reference (the provider rejects
@@ -1276,6 +1302,36 @@ async fn journaled_intents_redact_secrets() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
+    // A lending op carrying the scoped operator token, nested inside
+    // the force directive (the redaction walk must reach it at
+    // depth). This fixture's provider has no durable device world,
+    // so the surface answers its typed 404 — but the intent is
+    // journaled *before* execution, which is what the redaction must
+    // hold for.
+    let force_reclaim = json!({
+        "api_version": "volvisor.volume.v2",
+        "operation_id": "op-force-reclaim-redact",
+        "expected_lend_generation": 1,
+        "force": {
+            "operator_authorization": "super-secret-operator-token",
+            "residue_check": "inspect_and_record",
+        },
+    });
+    let (status, _) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            &format!("/v2/admin/devices/{FAKE_DEVICE}/reclaim"),
+            &force_reclaim,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no lending surface on this fixture"
+    );
+
     // Read the journal file back: neither secret may appear; the redaction
     // marker must. (The log is length/CRC framed, so read bytes and search
     // lossily — the JSON payload is embedded verbatim in the frames.)
@@ -1296,12 +1352,20 @@ async fn journaled_intents_redact_secrets() {
         "authorization_token leaked into the journal"
     );
     assert!(
+        !log.contains("super-secret-operator-token"),
+        "operator_authorization leaked into the journal"
+    );
+    assert!(
         log.contains("[redacted]"),
         "redaction marker must be journaled"
     );
     assert!(
         log.contains("vol-redact-e2e"),
         "non-secret identity is preserved"
+    );
+    assert!(
+        log.contains("op-force-reclaim-redact"),
+        "the lending op's identity is preserved"
     );
     drop(dir);
 }

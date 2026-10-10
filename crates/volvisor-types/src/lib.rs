@@ -55,7 +55,7 @@ pub use id::{
 pub use lending::{
     ClaimedBy, DeviceObservation, DeviceOwnershipResponse, DeviceSurfaceObservation, ForceReclaim,
     LendDeviceRequest, LendState, QuarantineReason, QuarantineState, ReclaimDeviceAck,
-    ReclaimDeviceRequest, ResidueCheck, ResolveQuarantineRequest,
+    ReclaimDeviceRequest, ResidueAcknowledgement, ResidueCheck, ResolveQuarantineRequest,
 };
 pub use request::{
     AccessModeRequest, AdoptVolumeRequest, AdoptVolumeResponse, CreateVolumeRequest,

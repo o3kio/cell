@@ -30,6 +30,12 @@
 //! mutations — here the record's pre-intent state is the only
 //! provable one).
 //!
+//! A save that *fails* (not crashes) gets the claiming layer's
+//! save-error discipline: the operation refuses its caller typed —
+//! the mutation is not acknowledged — and the served state falls
+//! back to durable truth, so a failed lend can never answer lent
+//! in-process (see [`FakeDeviceWorld`]'s records discipline).
+//!
 //! At the API layer the operations journal through the shared
 //! pipeline like every privileged mutation (`operation_id` +
 //! immutable request hash, Terminal replay class); an in-doubt retry
@@ -65,10 +71,12 @@
 //!   still-lent; a journaled foreign observation is honored into the
 //!   foreign-residue quarantine). For foreign residue it records the
 //!   operator's inspected-and-accepted resolution and ends the
-//!   borrower's tenure (the claim stays). An **unreadable ownership
-//!   record has no exit** — the refusal names the manual
-//!   remediation; nothing in this slice can reconcile a record it
-//!   cannot read.
+//!   borrower's tenure (the claim stays) — and the acceptance must
+//!   ride the wire explicitly (`residue_acknowledgement`, the
+//!   contract's name for it): the residue→clean conversion is never
+//!   silent. An **unreadable ownership record has no exit** — the
+//!   refusal names the manual remediation; nothing in this slice can
+//!   reconcile a record it cannot read.
 //! - **The force path's `operator_authorization`** follows the
 //!   admin-surface two-token model: the HTTP bearer token
 //!   authenticates the caller; the body token is the scoped
@@ -86,6 +94,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -96,7 +105,7 @@ use volvisor_types::{
     ApiError, ApiErrorCode, CellId, ClaimedBy, DeviceId, DeviceObservation,
     DeviceOwnershipResponse, DeviceSurfaceObservation, LendDeviceRequest, LendState, OperationId,
     QuarantineReason, QuarantineState, ReclaimDeviceAck, ReclaimDeviceRequest,
-    ResolveQuarantineRequest,
+    ResidueAcknowledgement, ResolveQuarantineRequest,
 };
 
 use crate::grow::{create_owner_only, sibling_tmp_path};
@@ -176,10 +185,19 @@ pub enum PendingIntent {
 /// The durable ownership-record store: one JSON file per provider
 /// (the [`crate::grow`] store discipline — serialize → owner-only
 /// tmp write → fsync → rename → directory fsync), consulting the
-/// [`STORE_DEVICE_OWNERSHIP`] crash seam at each commit boundary.
+/// [`STORE_DEVICE_OWNERSHIP`] crash seam at each commit boundary and
+/// carrying a one-shot save-failure seam for the error windows the
+/// crash seam's kills do not model (see
+/// [`DeviceOwnershipStore::fail_saves_after`]).
 pub struct DeviceOwnershipStore {
     path: PathBuf,
     crash: Arc<StoreCrashHooks>,
+    /// The save-failure countdown (the error-injection seam):
+    /// [`u64::MAX`] = not armed; otherwise the number of saves that
+    /// still proceed before the next one fails once. All saves run
+    /// under the world's records lock, so plain loads/stores are
+    /// race-free here.
+    successful_saves_remaining: AtomicU64,
 }
 
 impl DeviceOwnershipStore {
@@ -187,7 +205,11 @@ impl DeviceOwnershipStore {
     /// written by [`Self::save`]; construction itself performs no I/O.
     #[must_use]
     pub fn new(path: PathBuf, crash: Arc<StoreCrashHooks>) -> Self {
-        Self { path, crash }
+        Self {
+            path,
+            crash,
+            successful_saves_remaining: AtomicU64::new(u64::MAX),
+        }
     }
 
     /// The store's file path (named in unreadable-store refusals).
@@ -225,16 +247,50 @@ impl DeviceOwnershipStore {
     /// commit boundary (the grow-store discipline). A kill at
     /// `AfterTmpWrite`/`AfterFsyncBeforeRename` leaves the previous
     /// durable state; a kill at `AfterRename` makes the new state
-    /// durable — the armed rig chooses the window it proves.
+    /// durable — the armed rig chooses the window it proves. A save
+    /// that *fails* (not crashes) also leaves the previous durable
+    /// state live and refuses its caller typed; the served state then
+    /// falls back to durable truth (see [`FakeDeviceWorld::lend`] and
+    /// the world's `with_records` discipline).
     ///
     /// # Errors
-    /// Returns [`ApiError`] on any filesystem failure (the previous
-    /// durable state remains live).
+    /// Returns [`ApiError`] on any filesystem failure or the armed
+    /// injection (the previous durable state remains live).
     pub fn save(
         &self,
         records: &BTreeMap<DeviceId, DeviceOwnershipRecord>,
     ) -> Result<(), ApiError> {
+        // The error-injection window (one-shot, like the crash
+        // hooks' arms): fire before anything is written, so the
+        // previous durable state is exactly what remains.
+        let remaining = self.successful_saves_remaining.load(Ordering::SeqCst);
+        if remaining == 0 {
+            self.successful_saves_remaining
+                .store(u64::MAX, Ordering::SeqCst);
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                "injected device-ownership save failure (the test seam; the previous durable \
+                 state remains live)",
+            ));
+        }
+        if remaining != u64::MAX {
+            self.successful_saves_remaining
+                .store(remaining - 1, Ordering::SeqCst);
+        }
         save_records_atomic(&self.path, records, &self.crash)
+    }
+
+    /// Testkit: arm the save-failure seam — the next
+    /// `successful_saves_first` saves proceed normally, and the one
+    /// after them fails typed, once (the seam re-arms itself to
+    /// inert, like the crash hooks' one-shot arms). This models the
+    /// *error* window the crash seam's kills cannot: the caller
+    /// survives to be refused, and what the world serves afterwards
+    /// must fail closed on what is durable — never the un-journaled
+    /// mutation the failed save would have acknowledged.
+    pub fn fail_saves_after(&self, successful_saves_first: u64) {
+        self.successful_saves_remaining
+            .store(successful_saves_first, Ordering::SeqCst);
     }
 }
 
@@ -715,7 +771,9 @@ pub fn reclaim(
 ///
 /// # Errors
 /// Returns a typed [`ApiError`] when the device is not quarantined,
-/// the record is unreadable (no exit), or the token mismatches.
+/// the record is unreadable (no exit), the token mismatches, or a
+/// foreign-residue quarantine is resolved without the operator's
+/// explicit `residue_acknowledgement` (never a silent conversion).
 pub fn resolve_quarantine(
     records: &mut BTreeMap<DeviceId, DeviceOwnershipRecord>,
     store: &DeviceOwnershipStore,
@@ -732,9 +790,12 @@ pub fn resolve_quarantine(
     // to unlent, a reclaim to still-lent; a journaled foreign
     // observation is honored into the foreign-residue quarantine,
     // because ignoring it would risk reusing foreign residue). An
-    // explicit foreign-residue quarantine resolves by the operator's
-    // inspected-and-accepted judgment: the borrower's tenure ends,
-    // the claim stays.
+    // explicit foreign-residue quarantine resolves only by the
+    // operator's acknowledged, inspected-and-accepted judgment: the
+    // borrower's tenure ends, the claim stays — and the
+    // acknowledgement must ride the request (the contract's
+    // `residue_acknowledgement`), because a residue→clean conversion
+    // is never silent.
     let view = {
         let record = record_for(records, device_id)?;
         if record.corrupt.is_some() {
@@ -759,6 +820,25 @@ pub fn resolve_quarantine(
             }
             ownership_view(device_id, record)
         } else {
+            // The explicit foreign-residue exit needs the operator's
+            // acknowledgement on the wire — checked before anything
+            // is taken (a refusal writes nothing).
+            if let Some(quarantine) = &record.quarantine {
+                if matches!(quarantine.reason, QuarantineReason::ForeignResidue { .. })
+                    && request.residue_acknowledgement
+                        != Some(ResidueAcknowledgement::InspectedAndAccepted)
+                {
+                    return Err(ApiError::new(
+                        ApiErrorCode::InvalidState,
+                        format!(
+                            "device {device_id} is quarantined on foreign residue; \
+                             resolving it requires the operator's explicit residue \
+                             acknowledgement (residue_acknowledgement: \
+                             inspected_and_accepted) — never a silent conversion"
+                        ),
+                    ));
+                }
+            }
             match record.quarantine.take() {
                 None => {
                     return Err(ApiError::new(
@@ -874,21 +954,15 @@ impl std::fmt::Debug for FakeDeviceWorld {
 }
 
 impl FakeDeviceWorld {
-    /// Open the world over `path` (loading the records; an
-    /// unparseable file fails every operation closed — the
-    /// whole-store unreadable flavor).
-    ///
-    /// The fake's single device is seeded into a fresh map: a device
-    /// with no record is not a device this world serves, and the
-    /// entry (unclaimed, generation 0) is the honest starting state.
-    #[must_use]
-    pub fn open(
-        path: PathBuf,
-        crash: Arc<StoreCrashHooks>,
-        operator_token: Option<String>,
-    ) -> Self {
-        let store = DeviceOwnershipStore::new(path, crash);
-        let records = store
+    /// Load the records and seed the fake's device into a fresh map:
+    /// a device with no record is not a device this world serves, and
+    /// the entry (unclaimed, generation 0) is the honest starting
+    /// state. An unreadable file maps to the whole-store fail-closed
+    /// refusal (the `open` flavor).
+    fn load_seeded(
+        store: &DeviceOwnershipStore,
+    ) -> Result<BTreeMap<DeviceId, DeviceOwnershipRecord>, ApiError> {
+        store
             .load()
             .and_then(|mut records| {
                 let device = DeviceId::new(crate::admin::FAKE_DEVICE_ID)?;
@@ -904,7 +978,20 @@ impl FakeDeviceWorld {
                         store.path().display()
                     ),
                 )
-            });
+            })
+    }
+
+    /// Open the world over `path` (loading the records; an
+    /// unparseable file fails every operation closed — the
+    /// whole-store unreadable flavor).
+    #[must_use]
+    pub fn open(
+        path: PathBuf,
+        crash: Arc<StoreCrashHooks>,
+        operator_token: Option<String>,
+    ) -> Self {
+        let store = DeviceOwnershipStore::new(path, crash);
+        let records = Self::load_seeded(&store);
         Self {
             store,
             operator_token,
@@ -920,6 +1007,13 @@ impl FakeDeviceWorld {
         &self.store.crash
     }
 
+    /// Testkit: arm the store's save-failure seam (the error windows
+    /// the crash seam's kills do not model — see
+    /// [`DeviceOwnershipStore::fail_saves_after`]).
+    pub fn fail_saves_after(&self, successful_saves_first: u64) {
+        self.store.fail_saves_after(successful_saves_first);
+    }
+
     /// The configured operator-authorization token, when present.
     #[must_use]
     pub fn operator_token(&self) -> Option<&str> {
@@ -928,6 +1022,27 @@ impl FakeDeviceWorld {
 
     /// Run `f` under the records lock with the store; an unreadable
     /// store refuses closed before `f` runs.
+    ///
+    /// **The save-error discipline** (the claiming layer's, recorded
+    /// here): a failed operation never leaves its un-journaled
+    /// mutation served. The engine may have mutated the in-memory map
+    /// before the save that would have acknowledged it failed, so on
+    /// any error the map is replaced by a fresh seeded load of the
+    /// durable file — the LVM claiming layer's per-operation state is
+    /// simply discarded on failure and the next operation re-reads
+    /// durable truth, and this world's cached map gets the same rule
+    /// lazily. A rollback to the pre-operation snapshot would be
+    /// dishonest in the two-phase windows: an intent save that
+    /// *landed* before a failed effect save is durable truth the
+    /// served state must keep honoring (the pending intent derives
+    /// the quarantine). Poisoning the world until restart would be
+    /// stricter than the claiming layer, which keeps serving from
+    /// durable truth after a failed save. The re-load runs on every
+    /// refusal, not only save failures: refusals never mutate (the
+    /// engine checks before it writes), so for them the load is
+    /// inert — and the discipline needs no mutation tracking to stay
+    /// honest. A load that itself fails fails the slot closed until
+    /// restart (the `open` flavor).
     fn with_records<T>(
         &self,
         f: impl FnOnce(
@@ -943,7 +1058,13 @@ impl FakeDeviceWorld {
         })?;
         match &mut *guard {
             Err(unreadable) => Err(unreadable.clone()),
-            Ok(records) => f(records, &self.store),
+            Ok(records) => match f(records, &self.store) {
+                Ok(value) => Ok(value),
+                Err(refusal) => {
+                    *guard = Self::load_seeded(&self.store);
+                    Err(refusal)
+                }
+            },
         }
     }
 
@@ -1484,14 +1605,28 @@ mod tests {
         // The reclaim did not complete: the lend is still live.
         assert!(record.lend.is_some());
 
-        // The operator's explicit resolution ends the tenure.
+        // The exit is never silent: without the operator's explicit
+        // residue acknowledgement the resolve is a typed refusal.
         let resolve_req: ResolveQuarantineRequest = serde_json::from_value(serde_json::json!({
             "api_version": "volvisor.volume.v2",
             "operation_id": "op-resolve",
             "operator_authorization": "op-token"
         }))
         .expect("valid");
-        let view = resolve_quarantine(&mut records, &store, &device(), &resolve_req, None)
+        let err = resolve_quarantine(&mut records, &store, &device(), &resolve_req, None)
+            .expect_err("unacknowledged");
+        assert_eq!(err.code, ApiErrorCode::InvalidState);
+        assert!(err.detail.contains("residue acknowledgement"));
+
+        // The operator's explicit, acknowledged resolution ends the tenure.
+        let resolve_ack: ResolveQuarantineRequest = serde_json::from_value(serde_json::json!({
+            "api_version": "volvisor.volume.v2",
+            "operation_id": "op-resolve-ack",
+            "operator_authorization": "op-token",
+            "residue_acknowledgement": "inspected_and_accepted"
+        }))
+        .expect("valid");
+        let view = resolve_quarantine(&mut records, &store, &device(), &resolve_ack, None)
             .expect("resolve");
         assert!(view.quarantined.is_none());
         assert!(view.lend.is_none());
@@ -1575,11 +1710,26 @@ mod tests {
             QuarantineReason::ForeignResidue { .. }
         ));
 
-        // Resolving a device that is not quarantined is a typed
-        // refusal; an unreadable record has no exit at all.
-        let view = resolve_quarantine(&mut records, &store, &device(), &resolve_req, None)
+        // The acceptance of the reconciled foreign-residue quarantine
+        // is the operator's acknowledged judgment: without the
+        // acknowledgement it is a typed refusal; with it the tenure
+        // ends.
+        let err = resolve_quarantine(&mut records, &store, &device(), &resolve_req, None)
+            .expect_err("unacknowledged");
+        assert_eq!(err.code, ApiErrorCode::InvalidState);
+        let resolve_ack: ResolveQuarantineRequest = serde_json::from_value(serde_json::json!({
+            "api_version": "volvisor.volume.v2",
+            "operation_id": "op-resolve-ack",
+            "operator_authorization": "op-token",
+            "residue_acknowledgement": "inspected_and_accepted"
+        }))
+        .expect("valid");
+        let view = resolve_quarantine(&mut records, &store, &device(), &resolve_ack, None)
             .expect("resolve");
         assert!(view.quarantined.is_none());
+
+        // Resolving a device that is not quarantined is a typed
+        // refusal; an unreadable record has no exit at all.
         let err = resolve_quarantine(&mut records, &store, &device(), &resolve_req, None)
             .expect_err("not quarantined");
         assert_eq!(err.code, ApiErrorCode::InvalidState);

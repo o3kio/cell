@@ -15,6 +15,17 @@
 //! generations, the residue-check directive) is folded in — a
 //! differing body under the same `operation_id` is a typed
 //! `IDEMPOTENCY_CONFLICT`, never a silent second attempt.
+//!
+//! Rotation tolerance extends to the presenting operator: **a replay
+//! under the same `operation_id` returns the recorded first outcome
+//! regardless of which operator token presents it.** Authorization is
+//! decided when the operation first executes; the replay is a read of
+//! the record, not a second authorization decision — so a re-issued
+//! force or resolve after token rotation (or presented by a different
+//! operator holding a valid token) is a legitimate replay of the one
+//! recorded act, exactly like a re-issued claim. This is by design
+//! and consistent with the claim-rotation semantics of the admin
+//! surface.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -102,16 +113,21 @@ impl ReclaimDeviceRequest {
     }
 
     /// Canonical request hash for idempotency: the target device, the
-    /// operation id, the expected lend generation and the force
-    /// directive — **not** the force's `operator_authorization`
-    /// (credential material; a re-issued force after token rotation
-    /// for the same act is a legitimate replay, exactly like a
-    /// re-issued claim).
+    /// envelope version, the operation id, the expected lend
+    /// generation and the force directive — **not** the force's
+    /// `operator_authorization` (credential material; a re-issued
+    /// force after token rotation for the same act is a legitimate
+    /// replay, exactly like a re-issued claim). The `api_version` is
+    /// folded field-by-field to match the lend's whole-body fold
+    /// (which carries it): a different envelope under the same
+    /// `operation_id` is a different act.
     #[must_use]
     pub fn request_hash(&self, device_id: &DeviceId) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(b"volvisor.volume.v2:device_reclaim:");
         hasher.update(device_id.as_str().as_bytes());
+        hasher.update(b":");
+        hasher.update(self.api_version.as_bytes());
         hasher.update(b":");
         hasher.update(self.operation_id.as_str().as_bytes());
         hasher.update(b":");
@@ -157,14 +173,27 @@ pub enum ResidueCheck {
     InspectAndRecord,
 }
 
+/// The operator's explicit acknowledgement that recorded foreign
+/// residue was inspected and is accepted as the reason the borrower's
+/// tenure ends — the wire act of the foreign-residue quarantine exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResidueAcknowledgement {
+    /// The operator inspected the recorded residue and accepts ending
+    /// the borrower's tenure over it (the claim stays).
+    InspectedAndAccepted,
+}
+
 /// ResolveQuarantine request — the explicit operator action that
 /// exits a device's quarantine (P9-A's recorded exit decision).
 ///
 /// The resolution reconciles the journaled intent (a crash between a
 /// lend/reclaim journal and its effect) or records the operator's
-/// inspected-and-accepted judgment on foreign residue. An unreadable
-/// ownership record has **no** exit: the refusal names the manual
-/// remediation (fail-closed by design).
+/// inspected-and-accepted judgment on foreign residue — which the
+/// request must carry explicitly ([`ResidueAcknowledgement`]): the
+/// residue→clean conversion is never silent. An unreadable ownership
+/// record has **no** exit: the refusal names the manual remediation
+/// (fail-closed by design).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolveQuarantineRequest {
@@ -175,6 +204,12 @@ pub struct ResolveQuarantineRequest {
     /// Scoped operator-authorization token; compared by the provider,
     /// never logged or journaled verbatim.
     pub operator_authorization: String,
+    /// The operator's explicit acknowledgement that the recorded
+    /// foreign residue was inspected and accepted. Required to exit a
+    /// foreign-residue quarantine (the contract's
+    /// `residue_acknowledgement`); the intent-reconciliation paths
+    /// resolve by record proof, not judgment, and carry none.
+    pub residue_acknowledgement: Option<ResidueAcknowledgement>,
 }
 
 impl ResolveQuarantineRequest {
@@ -194,15 +229,27 @@ impl ResolveQuarantineRequest {
     }
 
     /// Canonical request hash for idempotency, folded with the target
-    /// device. The authorization token is excluded (credential
-    /// material; see [`ReclaimDeviceRequest::request_hash`]).
+    /// device, the envelope version, the operation id and the
+    /// residue acknowledgement. The authorization token is excluded
+    /// (credential material; see [`ReclaimDeviceRequest::request_hash`]);
+    /// the acknowledgement is the operator's immutable judgment, so a
+    /// resolve that carries it is a different act from one that does
+    /// not — the corrected attempt after an unacknowledged refusal
+    /// needs a fresh `operation_id`, like every Terminal retry.
     #[must_use]
     pub fn request_hash(&self, device_id: &DeviceId) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(b"volvisor.volume.v2:device_resolve_quarantine:");
         hasher.update(device_id.as_str().as_bytes());
         hasher.update(b":");
+        hasher.update(self.api_version.as_bytes());
+        hasher.update(b":");
         hasher.update(self.operation_id.as_str().as_bytes());
+        hasher.update(b":");
+        hasher.update(match self.residue_acknowledgement {
+            None => b"ack=none".as_slice(),
+            Some(_) => b"ack=inspected_and_accepted".as_slice(),
+        });
         hasher.finalize().into()
     }
 }
@@ -458,6 +505,14 @@ mod tests {
             plain.request_hash(&device()),
             other_generation.request_hash(&device())
         );
+        // The envelope version is folded (the lend's whole-body fold
+        // carries its own): a different envelope is a different act.
+        let mut other_version = plain.clone();
+        other_version.api_version = "volvisor.volume.v1".to_owned();
+        assert_ne!(
+            plain.request_hash(&device()),
+            other_version.request_hash(&device())
+        );
 
         // An empty force token is a validation-level rejection.
         let empty = reclaim_req(Some(""));
@@ -475,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_hash_excludes_the_token() {
+    fn resolve_hash_excludes_the_token_but_not_the_act() {
         let req: ResolveQuarantineRequest = serde_json::from_value(serde_json::json!({
             "api_version": "volvisor.volume.v2",
             "operation_id": "op-resolve-1",
@@ -483,13 +538,83 @@ mod tests {
         }))
         .expect("valid");
         assert!(req.validate().is_ok());
+        assert_eq!(req.residue_acknowledgement, None);
         let mut rotated = req.clone();
         rotated.operator_authorization = "token-b".to_owned();
         assert_eq!(req.request_hash(&device()), rotated.request_hash(&device()));
 
+        // The envelope version is folded, matching the lend/reclaim
+        // folds: a different envelope is a different act.
+        let mut other_version = req.clone();
+        other_version.api_version = "volvisor.volume.v1".to_owned();
+        assert_ne!(
+            req.request_hash(&device()),
+            other_version.request_hash(&device())
+        );
+
+        // The acknowledgement is the operator's immutable judgment:
+        // carrying it is a different act (the corrected attempt after
+        // an unacknowledged refusal needs a fresh operation id), and
+        // token rotation still replays with it carried.
+        let mut acknowledged = req.clone();
+        acknowledged.residue_acknowledgement = Some(ResidueAcknowledgement::InspectedAndAccepted);
+        assert!(acknowledged.validate().is_ok());
+        assert_ne!(
+            req.request_hash(&device()),
+            acknowledged.request_hash(&device())
+        );
+        let mut rotated_ack = acknowledged.clone();
+        rotated_ack.operator_authorization = "token-c".to_owned();
+        assert_eq!(
+            acknowledged.request_hash(&device()),
+            rotated_ack.request_hash(&device())
+        );
+
         let mut empty = req.clone();
         empty.operator_authorization = String::new();
         assert!(empty.validate().is_err());
+    }
+
+    #[test]
+    fn residue_acknowledgement_is_optional_and_typed() {
+        let json = serde_json::json!("inspected_and_accepted");
+        assert_eq!(
+            serde_json::from_value::<ResidueAcknowledgement>(json).expect("acknowledgement"),
+            ResidueAcknowledgement::InspectedAndAccepted
+        );
+        assert!(
+            serde_json::from_value::<ResidueAcknowledgement>(serde_json::json!("skipped")).is_err()
+        );
+
+        // Absent on the wire: `None` — the reconciliation paths need
+        // no judgment, and an unknown field is still a rejection.
+        let base: ResolveQuarantineRequest = serde_json::from_value(serde_json::json!({
+            "api_version": "volvisor.volume.v2",
+            "operation_id": "op-r",
+            "operator_authorization": "token-a",
+        }))
+        .expect("valid");
+        assert_eq!(base.residue_acknowledgement, None);
+        let acknowledged: ResolveQuarantineRequest = serde_json::from_value(serde_json::json!({
+            "api_version": "volvisor.volume.v2",
+            "operation_id": "op-r",
+            "operator_authorization": "token-a",
+            "residue_acknowledgement": "inspected_and_accepted",
+        }))
+        .expect("valid");
+        assert_eq!(
+            acknowledged.residue_acknowledgement,
+            Some(ResidueAcknowledgement::InspectedAndAccepted)
+        );
+        assert!(
+            serde_json::from_value::<ResolveQuarantineRequest>(serde_json::json!({
+                "api_version": "volvisor.volume.v2",
+                "operation_id": "op-r",
+                "operator_authorization": "token-a",
+                "residue_acknowledgement": "skipped",
+            }))
+            .is_err()
+        );
     }
 
     #[test]
