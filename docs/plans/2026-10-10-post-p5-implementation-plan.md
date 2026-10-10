@@ -371,6 +371,25 @@ decision (build / do not build) is recorded with the measurements that
 carry it. If no benchmark can be run yet, the gate's still-closed state is
 recorded — the consideration item is decided, not silently deferred.
 
+**Resolution (PR #28).** The methodology is delivered at
+[docs/benchmarks/engine-comparison-methodology.md](../benchmarks/engine-comparison-methodology.md)
+— purpose, the honesty spine (per-engine durability contracts stated
+alongside every number; a benchmark is not a durability proof), matched
+topology and the pin list, the workload matrix (matched queue depths,
+CPU cost, flush/FUA variants, resync-under-foreground, the operational
+behaviors, all through the real VMM frontend), the campaign's run
+discipline, and the five-criterion decision gate. The decision is
+recorded: **the gate stays closed — do not build a new engine now.**
+No benchmark can honestly run in this phase (this development sandbox
+has no DRBD 9 kernel module, no Mayastor/SPDK installation, and no
+matched hardware — not two physical hosts of the same model with the
+same NVMe SKUs); the measurements that could carry a build decision do
+not exist, and the still-closed state is the decision, recorded in the
+methodology doc (§7), the nearline §10 ledger's benchmark row, and
+SPEC-0002 §12's P8 line. The gate reopens only by executing the
+methodology on matched hardware — the reopen condition is the
+measurements' existence, not a better argument.
+
 ### P8-C: the local-mirror experiment decision
 
 **Scope.** The §12 P3 residue: the local mirror experiment ("no mirror
@@ -388,6 +407,30 @@ plan's amendment and the ledger.
 
 **Completion gate.** The residue is decided — the ledger no longer carries
 it as an open "not delivered, undecided" item.
+
+**Resolution (PR #28).** Declined, with the recorded reason and the
+reopenable sketch:
+[ADR-0011](../adr/0011-local-mirror-experiment-decline.md). No
+local-mirror implementation exists and none is authorized by any accepted
+contract or ADR suite; the durability need is carried by cross-host
+nearline replication, and a local mirror's value proposition (surviving
+single-device loss without cross-host failover) is a new availability tier
+no consumer has contracted for; the validating fault classes
+(ADR-0007's R3: single leg loss, repair, rebuild contention) only exist
+on real media, which none of the delivered tiers provides (Tier S's
+storage is a block map with no device granule; Tier V's devhost storage
+below the VMM seam is simulated); and the design space where a mirror
+could return is already reserved by ADR-0006's acceptance-suite gate —
+whose suite already contains the mirror-relevant cells (4K random
+writes during mirror, source SSD failure), without requiring the QSD
+pivot itself. The sketch — mirror layout, the fault classes and
+their evidence shapes, what the real-host/media tier would have to run —
+is recorded in the ADR's appendix so the residue is closed but
+reopenable: the reopen condition is a consumer contracting for the
+availability tier AND a mirror design passing ADR-0006's gate. The
+nearline §10 ledger's mirror line and SPEC-0002 §12's P3 row now record
+the decided state; ADR-0007's Related list cross-links the decision so
+R3's readers find its status.
 
 ## 4. P9 — the Rook-cell device-sharing POC
 

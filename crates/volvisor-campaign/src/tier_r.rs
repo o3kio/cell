@@ -133,9 +133,10 @@ pub const SCENARIOS: &[Scenario] = &[
         family: "local mirror leg loss",
         class: "local mirror leg loss / repair / rebuild",
         skip_reason: "no local mirror implementation exists to fault (plan §1) — real \
-                      hardware alone does not open this gate; the mirror model and its \
-                      Tier R gate are a recorded follow-up requiring a mirror \
-                      implementation first",
+                      hardware alone does not open this gate; the experiment is declined \
+                      and the follow-up is ADR-0011's reopenable sketch \
+                      (docs/adr/0011-local-mirror-experiment-decline.md), so this gate \
+                      still opens only when a mirror implementation exists to fault",
         body: "fail one leg of a real local mirror under foreground writes; prove \
                repair/rebuild preserves the acknowledged prefix and the steady-state \
                write ordering contract (nearline §4) — nothing to drive until a mirror \
