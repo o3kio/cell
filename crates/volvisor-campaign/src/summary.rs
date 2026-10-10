@@ -48,6 +48,7 @@ macro_rules! line {
 
 use crate::matrix::{self, Family};
 use crate::tier_r;
+use crate::tier_v;
 
 /// The suite's whole-campaign bound (§3.2: "the whole campaign
 /// inside the existing suite budget ~60s"), in milliseconds. The
@@ -598,6 +599,15 @@ fn cg1_class_coverage(records: &[Value]) -> GateStatus {
             missing.push(format!("tier-r/{} (no gate record)", scenario.name));
         }
     }
+    // The Tier V gate (ADR-0010): every scenario's record must exist
+    // — a skip (the default environment, the CI runners) or a run —
+    // never a hole. The same never-silent-absence rule as Tier R;
+    // the tier's own bodies assert what a run observed.
+    for scenario in tier_v::SCENARIOS {
+        if record_for(records, &format!("tier-v/{}", scenario.name)).is_none() {
+            missing.push(format!("tier-v/{} (no gate record)", scenario.name));
+        }
+    }
     // The single-commit certification (the comprehensive review's
     // U3): the gates certify ONE campaign at ONE commit. The `--all`
     // merge is latest-wins per scenario (a feature — a partial
@@ -644,10 +654,12 @@ fn cg1_class_coverage(records: &[Value]) -> GateStatus {
         complete: missing.is_empty(),
         detail: if missing.is_empty() {
             format!(
-                "every §9 Tier S row (1-16) has its records and every Tier R-only class \
-                 carries its gate record ({} skipped records), all at one commit ({}); \
-                 the §9 mapping is realized in the coverage matrix",
+                "every §9 Tier S row (1-16) has its records, every Tier R-only class \
+                 carries its gate record ({} skipped records), and every Tier V scenario \
+                 carries its gate record ({} scenarios; skipped or run, never a hole), \
+                 all at one commit ({}); the §9 mapping is realized in the coverage matrix",
                 tier_r::SCENARIOS.len(),
+                tier_v::SCENARIOS.len(),
                 records
                     .first()
                     .and_then(|record| record["commit"].as_str())
@@ -931,6 +943,22 @@ const CLAIM_PHRASES: [&str; 5] = [
 /// literally carry them).
 const TIER_R_CLAIM_PHRASES: [&str; 1] = ["production support"];
 
+/// Tier V's claim vocabulary (ADR-0010): everything Tier S cannot
+/// claim, EXCEPT `real vmm` — the one claim this tier exists to
+/// make, and only in a run record that carries the binary stamps
+/// (version + SHA256, gated below). A Tier V record may say it
+/// verified the VMM seam against a real VMM process; it may never
+/// claim real-host durability, real DRBD or real media — the
+/// storage below the seam is simulated in every Tier V record, and
+/// the tier must never be presented as closing the Tier R gates
+/// (ADR-0010's non-goals).
+const TIER_V_CLAIM_PHRASES: [&str; 4] = [
+    "production support",
+    "real-host",
+    "real drbd",
+    "proven on hardware",
+];
+
 /// The negations that can open a DISCLAIMER (the comprehensive
 /// surface round-2 N3): a Tier S record stating the discipline ("no
 /// real-host claim is made") upholds the very rule this gate
@@ -1030,12 +1058,16 @@ fn cg5_claim_discipline(records: &[Value]) -> GateStatus {
         // hand-authored record — the stricter reading, not a bypass.
         // A Tier R record naming the real-host gate is the
         // discipline WORKING, not violating it — hence the per-tier
-        // vocabulary (round-2 N1).
+        // vocabulary (round-2 N1). Tier V (ADR-0010) may claim
+        // exactly one thing — verification against a real VMM
+        // process — so its vocabulary is Tier S's minus that
+        // phrase, with the claim's EVIDENCE gated by the
+        // shape-coherence clause below.
         let tier = record["tier"].as_str().unwrap_or("S");
-        let vocabulary: &[&str] = if tier == "S" {
-            &CLAIM_PHRASES
-        } else {
-            &TIER_R_CLAIM_PHRASES
+        let vocabulary: &[&str] = match tier {
+            "S" => &CLAIM_PHRASES,
+            "V" => &TIER_V_CLAIM_PHRASES,
+            _ => &TIER_R_CLAIM_PHRASES,
         };
         let text = serde_json::to_string(record)
             .unwrap_or_default()
@@ -1076,9 +1108,15 @@ fn cg5_claim_discipline(records: &[Value]) -> GateStatus {
             claimed.join(", ")
         ));
     }
+    problems.extend(tier_v_shape_problems(records));
     let ungated: Vec<String> = tier_r::SCENARIOS
         .iter()
         .map(|scenario| format!("tier-r/{}", scenario.name))
+        .chain(
+            tier_v::SCENARIOS
+                .iter()
+                .map(|scenario| format!("tier-v/{}", scenario.name)),
+        )
         .filter(|scenario| record_for(records, scenario).is_none())
         .collect();
     if !ungated.is_empty() {
@@ -1094,14 +1132,66 @@ fn cg5_claim_discipline(records: &[Value]) -> GateStatus {
             format!(
                 "no record claims production support or real-host durability from Tier S \
                  evidence, every Tier R scenario states its gate as a gate statement \
-                 ({} records); the report header carries the discipline verbatim and \
-                 the not-delivered §10 rows are enumerated in the nearline §10 note",
-                tier_r::SCENARIOS.len()
+                 ({} records), and every Tier V record's claim shape is coherent ({} \
+                 scenarios: a skip observes nothing, a run names its VMM); the report \
+                 header carries the discipline verbatim and the not-delivered §10 rows \
+                 are enumerated in the nearline §10 note",
+                tier_r::SCENARIOS.len(),
+                tier_v::SCENARIOS.len()
             )
         } else {
             problems.join("; ")
         },
     }
+}
+
+/// The Tier V shape coherence (ADR-0010), CG5's per-tier clause: a
+/// run record that does not name the exact VMM it verified against
+/// is not evidence. A non-skip Tier V record must carry the
+/// cloud-hypervisor AND ch-remote stamps (version + 64-hex SHA256)
+/// in its components; a skip record must observe nothing (components
+/// null — claiming component versions for a scenario that did not
+/// run would be fabrication). The write seam (`finish_tier_v_skip`)
+/// emits the null shape; this is the read-side defense in depth.
+fn tier_v_shape_problems(records: &[Value]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for record in records
+        .iter()
+        .filter(|record| record["tier"].as_str() == Some("V"))
+    {
+        let scenario = record["scenario"].as_str().unwrap_or("?");
+        let skipped = record["outcome"]
+            .as_str()
+            .is_some_and(|outcome| outcome.eq_ignore_ascii_case("skipped"));
+        if skipped {
+            if !record["components"].is_null() {
+                problems.push(format!(
+                    "record {scenario} is a skipped Tier V gate statement but carries \
+                     components — a skip observes nothing about the environment"
+                ));
+            }
+            continue;
+        }
+        let stamped = |node: &Value| {
+            node["version"]
+                .as_str()
+                .is_some_and(|version| !version.is_empty())
+                && node["sha256"].as_str().is_some_and(|digest| {
+                    digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit())
+                })
+        };
+        if !stamped(&record["components"]["vmm"]["cloud_hypervisor"])
+            || !stamped(&record["components"]["vmm"]["ch_remote"])
+        {
+            problems.push(format!(
+                "record {scenario} claims a Tier V run without the VMM binary stamps \
+                 (components.vmm.cloud_hypervisor / ch_remote must carry a version and a \
+                 64-hex SHA256) — a run that does not name the exact VMM it verified \
+                 against is not evidence (ADR-0010)"
+            ));
+        }
+    }
+    problems
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,7 +1308,11 @@ pub fn build_campaign_report(dirs: &[PathBuf]) -> String {
     report.push_str(
         "> Tier S proves the implemented logic's behavior under the bounded\n\
          > injected fault space (§0/§3.2); it proves nothing about real media,\n\
-         > real DRBD, or a real VMM; production support is not claimed.\n\n",
+         > real DRBD, or a real VMM; production support is not claimed.\n\
+         > Tier V records verify the VMM seam against a real cloud-hypervisor\n\
+         > at recorded binary versions (version + SHA256); the storage below\n\
+         > the seam is simulated in every Tier V record, and no Tier V record\n\
+         > claims real-host durability or closes the Tier R gates.\n\n",
     );
     render_provenance(&mut report, &campaign);
     render_coverage_matrix(&mut report, records);
@@ -1253,6 +1347,10 @@ fn render_provenance(report: &mut String, campaign: &Campaign) {
         .iter()
         .filter(|record| record["tier"].as_str() == Some("R"))
         .count();
+    let real_vmm_count = records
+        .iter()
+        .filter(|record| record["tier"].as_str() == Some("V"))
+        .count();
     let commit_cell = if commits.len() == 1 {
         format!("`{}`", commits[0])
     } else {
@@ -1285,7 +1383,7 @@ fn render_provenance(report: &mut String, campaign: &Campaign) {
     };
     line!(
         report,
-        "- Runs: {}\n- Commit: {}\n- Kernel: {}\n- Records: {} (Tier S: {}, Tier R: {})",
+        "- Runs: {}\n- Commit: {}\n- Kernel: {}\n- Records: {} (Tier S: {}, Tier R: {}, Tier V: {})",
         campaign
             .runs
             .iter()
@@ -1306,8 +1404,9 @@ fn render_provenance(report: &mut String, campaign: &Campaign) {
         commit_cell,
         kernel_cell,
         records.len(),
-        records.len() - tier_r_count,
+        records.len() - tier_r_count - real_vmm_count,
         tier_r_count,
+        real_vmm_count,
     );
 }
 
@@ -1351,6 +1450,13 @@ fn render_coverage_matrix(report: &mut String, records: &[Value]) {
             duration_cell,
         );
     }
+    render_tier_r_rows(report, records);
+    render_tier_v_rows(report, records);
+}
+
+/// The Tier R gate rows: a skip (or blocked) record renders its
+/// outcome and reason — the matrix shows the gate, never a hole.
+fn render_tier_r_rows(report: &mut String, records: &[Value]) {
     for scenario in tier_r::SCENARIOS {
         let name = format!("tier-r/{}", scenario.name);
         let (verdict_cell, duration_cell) = match record_for(records, &name) {
@@ -1372,6 +1478,55 @@ fn render_coverage_matrix(report: &mut String, records: &[Value]) {
         line!(
             report,
             "| — | R | {} | {} | `{}` | {} | {} |",
+            scenario.family,
+            scenario.class,
+            name,
+            verdict_cell,
+            duration_cell,
+        );
+    }
+}
+
+/// The Tier V rows (ADR-0010): a skip renders its gate statement
+/// exactly like Tier R's; a RUN renders its observed outcome —
+/// free-form by design (a finding is an honest outcome, e.g. the
+/// resize route's typed 404) — with the binary versions the
+/// record's components carry (the full stamps are gated by CG5's
+/// coherence clause).
+fn render_tier_v_rows(report: &mut String, records: &[Value]) {
+    for scenario in tier_v::SCENARIOS {
+        let name = format!("tier-v/{}", scenario.name);
+        let (verdict_cell, duration_cell) = match record_for(records, &name) {
+            Some(record) => {
+                let outcome = record["outcome"].as_str().unwrap_or("?");
+                let detail = if outcome.eq_ignore_ascii_case("skipped") {
+                    record["reason"].as_str().unwrap_or("?").to_owned()
+                } else {
+                    format!(
+                        "{} + {}",
+                        record["components"]["vmm"]["cloud_hypervisor"]["version"]
+                            .as_str()
+                            .unwrap_or("?"),
+                        record["components"]["vmm"]["ch_remote"]["version"]
+                            .as_str()
+                            .unwrap_or("?")
+                    )
+                };
+                (
+                    format!("{outcome} ({detail})"),
+                    record["duration_ms"]
+                        .as_u64()
+                        .map_or_else(|| "—".to_owned(), |ms| format!("{ms} ms")),
+                )
+            }
+            None => (
+                "**MISSING** (no gate record — a hole, not a gate)".to_owned(),
+                "—".to_owned(),
+            ),
+        };
+        line!(
+            report,
+            "| — | V | {} | {} | `{}` | {} | {} |",
             scenario.family,
             scenario.class,
             name,

@@ -188,6 +188,22 @@ impl Evidence {
         }
     }
 
+    /// Begin a Tier V record for `scenario` (ADR-0010): the
+    /// real-VMM tier. A skipped gate statement finishes with
+    /// [`Self::finish_tier_v_skip`]; a RUN record finishes with the
+    /// normal [`Self::finish`] (log capture included) and MUST
+    /// carry a `components` override naming the real VMM binaries
+    /// (version + SHA256) — a Tier V pass that does not name the
+    /// exact VMM it verified against fails the summary's claim
+    /// gates (CG5's shape-coherence clause).
+    #[must_use]
+    pub fn new_tier_v(scenario: &str) -> Self {
+        Self {
+            tier: "V",
+            ..Self::new(scenario)
+        }
+    }
+
     /// The injected fault (§6: kind + the exact armed point).
     pub fn fault(&mut self, kind: &str, at: &str) -> &mut Self {
         self.fault = Some((kind.to_owned(), at.to_owned()));
@@ -447,6 +463,90 @@ impl Evidence {
             "duration_ms": u64::try_from(self.started.elapsed().as_millis())
                 .expect("scenario duration fits a u64"),
         });
+        let path = dir.join(format!("{}.json", self.scenario));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("evidence dir");
+        }
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&record).expect("record JSON"),
+        )
+        .expect("write record");
+        path
+    }
+
+    /// Finish a Tier V SKIP record (ADR-0010's env gate, the Tier R
+    /// pattern applied): the default environment's explicit gate
+    /// statement — `outcome: "skipped"` with the reason and the
+    /// documented body, `components` null (a skip observes nothing
+    /// about the environment; claiming component versions for a
+    /// scenario that did not run would be fabrication). Writes into
+    /// the LIVE run directory and refreshes `REPORT.md` like any
+    /// finish.
+    ///
+    /// The outcome vocabulary is `skipped` only: unlike Tier R
+    /// (whose scaffold cannot run on any host yet), every Tier V
+    /// scenario body IS implemented — a claimed environment that
+    /// cannot back the claim fails the test loudly before any
+    /// record is written, so there is no Tier V `blocked` shape.
+    ///
+    /// # Panics
+    ///
+    /// When `outcome` is anything but `skipped` — a Tier V gate
+    /// statement is a skip, never a pass (a run record goes through
+    /// [`Self::finish`] with its real components).
+    pub fn finish_tier_v_skip(self, reason: &str, would_run: &str) -> PathBuf {
+        let dir = run_dir();
+        let path = self.write_tier_v_skip_record(&dir, reason, would_run);
+        render_report(&dir);
+        path
+    }
+
+    /// Finish a Tier V skip record into an EXPLICIT directory — the
+    /// staging seam for the substrate's unit tests (a constructed
+    /// environment must never write into the live evidence tree).
+    /// No report refresh: a staging directory is not a run
+    /// directory.
+    pub fn finish_tier_v_skip_at(self, dir: &Path, reason: &str, would_run: &str) -> PathBuf {
+        self.write_tier_v_skip_record(dir, reason, would_run)
+    }
+
+    /// The Tier V skip-record writer (shared by the live and staging
+    /// seams): the same gate-statement shape as Tier R's, with the
+    /// tier field the record began with ("V") and `components` null.
+    /// No synthetic-host marker guard: the Tier V skip record
+    /// carries no component claim at all (the fabrication risk a
+    /// marker would catch is a fake RUN record, and that shape is
+    /// policed on read by the summary's CG5 coherence clause — a
+    /// non-skip Tier V record without real VMM version+SHA256
+    /// components fails the gate).
+    ///
+    /// # Panics
+    ///
+    /// When `outcome` is anything but `skipped` (see
+    /// [`Self::finish_tier_v_skip`]).
+    fn write_tier_v_skip_record(&self, dir: &Path, reason: &str, would_run: &str) -> PathBuf {
+        let record = json!({
+            "scenario": self.scenario,
+            "tier": self.tier,
+            "commit": git_commit(),
+            "kernel": kernel_release(),
+            "components": null,
+            "fault": null,
+            "oracle": null,
+            "invariants": [],
+            "logs": null,
+            "outcome": "skipped",
+            "reason": reason,
+            "would_run": would_run,
+            "duration_ms": u64::try_from(self.started.elapsed().as_millis())
+                .expect("scenario duration fits a u64"),
+        });
+        assert!(
+            self.tier == "V",
+            "finish_tier_v_skip is the Tier V seam (tier is {:?})",
+            self.tier
+        );
         let path = dir.join(format!("{}.json", self.scenario));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("evidence dir");

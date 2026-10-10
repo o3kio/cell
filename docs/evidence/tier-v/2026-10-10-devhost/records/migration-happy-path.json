@@ -1,0 +1,58 @@
+{
+  "commit": "e8b092d1d178080dcc974462e9b18ed179034505",
+  "components": {
+    "drbd-tooling": "fake",
+    "vmm": {
+      "ch_remote": {
+        "path": "/var/lib/chv/qual/installsh-root/usr/local/bin/ch-remote",
+        "sha256": "a1a978e16bdb4ec762e92cab00f4983f9ce722d7b191ac3a40f102feafcd9713",
+        "version": "ch-remote v51.1"
+      },
+      "cloud_hypervisor": {
+        "path": "/usr/bin/cloud-hypervisor",
+        "sha256": "a250a9347d0ea9e93f88b54b25df3cdc6a9ba3c57f292aaf74bb664fb5c87496",
+        "version": "cloud-hypervisor v43.0.0"
+      },
+      "guest": "direct kernel boot (host kernel + initramfs to a busybox shell on ttyS0); the guest issues no disk I/O — the write workload is the rig's model through the simulated device",
+      "storage_below_the_seam": "simulated (the campaign's fake DRBD worlds; file-backed disks at the DRBD device paths)"
+    },
+    "volvisord": "in-process daemons over the real router (the campaign rig)",
+    "witness": "in-process"
+  },
+  "duration_ms": 1767,
+  "fault": null,
+  "invariants": [
+    {
+      "g5_no_resume_over_barrier": "pass: barrier non-voided and all-true; source never resumed"
+    },
+    {
+      "d6a_provider_inspect": "pass: authority epoch 2, holder node-b"
+    },
+    {
+      "real_vmm_state_claims_observed": "pass: every VM state claim is an api-socket observation (source destroyed, destination resumed), never a command's exit status"
+    }
+  ],
+  "kernel": "6.8.0-142-generic",
+  "logs": {
+    "destination_journal": "/root/git/volvisor/target/campaign-evidence/run-3742745/logs/tier-v/migration-happy-path/b/journal.log",
+    "journal": "/root/git/volvisor/target/campaign-evidence/run-3742745/logs/tier-v/migration-happy-path/a/journal.log",
+    "migration_records": "/root/git/volvisor/target/campaign-evidence/run-3742745/logs/tier-v/migration-happy-path/a/migrations",
+    "peer_preparations": "/root/git/volvisor/target/campaign-evidence/run-3742745/logs/tier-v/migration-happy-path/b/peer-preparations",
+    "witness": "/root/git/volvisor/target/campaign-evidence/run-3742745/logs/tier-v/migration-happy-path/witness"
+  },
+  "oracle": {
+    "acknowledged": 0,
+    "barrier_durable_at": 1000,
+    "boundary_seq": null,
+    "boundary_skew_ticks": null,
+    "boundary_source": "data-path",
+    "corrupted": 0,
+    "stop_reason": "nothing-acked",
+    "tail": 0,
+    "verified": 0,
+    "verified_side": "destination"
+  },
+  "outcome": "complete: the full mobility protocol (prepare → transfer → cut → grant → restore → resume) landed on a real cloud-hypervisor pair — every VM state claim an api-socket observation (the binary stamps are this record's components)",
+  "scenario": "tier-v/migration-happy-path",
+  "tier": "V"
+}

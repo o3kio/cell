@@ -1,7 +1,7 @@
 # ADR-0010 — Tier V: real-VMM verification of the migration story
 
-Status: Proposed (P8 implementation scope)
-Decision-accepted: pending (record acceptance date and accepting authority here)
+Status: Accepted (P8-A delivered — the substrate and its four bounded scenarios live in `crates/volvisor-campaign` (`src/tier_v.rs`, `tests/tier_v.rs`), and the first recorded host run is committed at `docs/evidence/tier-v/2026-10-10-devhost/`; PR #27)
+Decision-accepted: 2026-10-10, on the P8-A completion gate (the recorded real-VMM run's evidence at `e8b092d`, the skip-mode certification over the same tree, and the nearline §10 ledger's Tier V line moved to the delivered truth)
 Note: the decision itself is already recorded by the readiness plan D2
 (PR #17); this ADR is its normative elaboration, and its status flips to
 Accepted when the P8-A completion gate passes.

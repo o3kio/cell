@@ -1,0 +1,44 @@
+{
+  "commit": "e8b092d1d178080dcc974462e9b18ed179034505",
+  "components": {
+    "drbd-tooling": "fake",
+    "vmm": {
+      "ch_remote": {
+        "path": "/var/lib/chv/qual/installsh-root/usr/local/bin/ch-remote",
+        "sha256": "a1a978e16bdb4ec762e92cab00f4983f9ce722d7b191ac3a40f102feafcd9713",
+        "version": "ch-remote v51.1"
+      },
+      "cloud_hypervisor": {
+        "path": "/usr/bin/cloud-hypervisor",
+        "sha256": "a250a9347d0ea9e93f88b54b25df3cdc6a9ba3c57f292aaf74bb664fb5c87496",
+        "version": "cloud-hypervisor v43.0.0"
+      },
+      "guest": "direct kernel boot (host kernel + initramfs to a busybox shell on ttyS0); the guest issues no disk I/O — the write workload is the rig's model through the simulated device",
+      "storage_below_the_seam": "simulated (the campaign's fake DRBD worlds; file-backed disks at the DRBD device paths)"
+    },
+    "volvisord": "in-process daemons over the real router (the campaign rig)",
+    "witness": "in-process"
+  },
+  "duration_ms": 60,
+  "fault": null,
+  "invariants": [
+    {
+      "notification_contract_both_ways": "pass: the notification's composed status is a real observation (finding: the real binary answers vm.resize-disk with the typed refusal carried in the durable record (vm.resize-disk for VM vm-tv4-2 (disk vm-tv4-2-disk-0, 2147483648 bytes) refused: HTTP 404 : Server: Cloud Hypervisor API Connection: keep-alive Content-Type: application/json Content-Length: 9 Not Found); the fail-closed contract held — the grow completed, the notification is retry_required, never a silent un-notified success); the refused version gate fails closed before any VMM call"
+    },
+    {
+      "version_gate_probed_from_the_real_binary": "pass: both gate legs probed the real binary's --version output through the real runner (proven minimum 37.0.0, refused minimum 99.0.0)"
+    }
+  ],
+  "kernel": "6.8.0-142-generic",
+  "logs": {
+    "destination_journal": "/root/git/volvisor/target/campaign-evidence/run-3742745/logs/tier-v/resize-notification/b/journal.log",
+    "journal": "/root/git/volvisor/target/campaign-evidence/run-3742745/logs/tier-v/resize-notification/a/journal.log",
+    "migration_records": "/root/git/volvisor/target/campaign-evidence/run-3742745/logs/tier-v/resize-notification/a/migrations",
+    "peer_preparations": "/root/git/volvisor/target/campaign-evidence/run-3742745/logs/tier-v/resize-notification/b/peer-preparations",
+    "witness": "/root/git/volvisor/target/campaign-evidence/run-3742745/logs/tier-v/resize-notification/witness"
+  },
+  "oracle": null,
+  "outcome": "complete: the P6 grow notification was driven against a real VMM — both version-gate legs probed from the real binary, the fail-closed retry contract, and the retry pass",
+  "scenario": "tier-v/resize-notification",
+  "tier": "V"
+}
