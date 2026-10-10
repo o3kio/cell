@@ -420,8 +420,10 @@ no consumer has contracted for; the validating fault classes
 on real media, which none of the delivered tiers provides (Tier S's
 storage is a block map with no device granule; Tier V's devhost storage
 below the VMM seam is simulated); and the design space where a mirror
-could return is already reserved by ADR-0006's acceptance-suite gate (a
-QSD-era capability). The sketch — mirror layout, the fault classes and
+could return is already reserved by ADR-0006's acceptance-suite gate —
+whose suite already contains the mirror-relevant cells (4K random
+writes during mirror, source SSD failure), without requiring the QSD
+pivot itself. The sketch — mirror layout, the fault classes and
 their evidence shapes, what the real-host/media tier would have to run —
 is recorded in the ADR's appendix so the residue is closed but
 reopenable: the reopen condition is a consumer contracting for the

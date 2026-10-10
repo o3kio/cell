@@ -66,8 +66,10 @@ deferral. The reasons:
    its acceptance suite (and its Option C language already warns
    against hand-rolled block copiers for exactly the correctness
    reasons a mirror would face). A future local-mirror slice would
-   enter as a QSD-era capability through that gate, not through this
-   residue.
+   enter through that gate — whose suite already contains the
+   mirror-relevant cells (4K random writes during mirror, source SSD
+   failure) — without requiring the QSD pivot itself, not through
+   this residue.
 
 ## The reopenable sketch
 
@@ -124,7 +126,8 @@ promises are only as good as the media semantics beneath it.
 The experiment reopens when **a consumer contracts for the
 availability tier** (single-device loss survivable without
 cross-host failover) **and a mirror design passes ADR-0006's
-acceptance-suite gate** as a QSD-era capability on real media. Until
+acceptance-suite gate** on real media — through the suite's
+mirror-relevant cells, without requiring the QSD pivot itself. Until
 both hold, the nearline §10 ledger's mirror line records this
 decline, and the `tier-r/mirror-leg-loss` gate remains the honest
 record of what was not run.

@@ -41,8 +41,10 @@ a bench-only build is not a gap in the deployed system.
 
 ## 2. The honesty spine
 
-**A benchmark is not a durability proof** (the nearline §10 ledger's
-own rule, and AGENTS rule 16). No number in this comparison licenses
+**A benchmark is not a durability proof** (the nearline §10/§11
+ledger discipline, and AGENTS.md's unnumbered closing rule — "a
+benchmark is not a durability proof; a happy-path migration is not a
+split-brain proof"). No number in this comparison licenses
 a durability claim; durability evidence lives in the failure-campaign
 tiers and, for any candidate engine, in its own proof obligations
 (redo log, ordering, crash replay, fencing, migration safety —
