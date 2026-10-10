@@ -167,7 +167,7 @@ the previous numbering's items):
 |---|---|---|
 | P0/P1 | stable IDs, device claiming, single-volume API/attachments with provider conformance; native-local LVM prototype with thin-space safeguards and direct VFIO as a distinct special profile | PR #3 |
 | P2 | existing-Ceph RBD adapter with shared-backend attach/migration validation | PR #4 |
-| P3 | nearline DRBD baseline and isolated frontends (the local-mirror experiment residue is decided in P8) | PR #5 |
+| P3 | nearline DRBD baseline and isolated frontends (the local-mirror experiment residue: decided in P8 — declined, [ADR-0011](../adr/0011-local-mirror-experiment-decline.md)) | PR #5 |
 | P4a/P4b | witness/lease design and fencing; barrier state machine, VM/storage cutover | PRs #6–#10 |
 | P5 | aggressive failure campaign: crash/failure evidence with the certified completion gates | PRs #11–#16 |
 
@@ -175,7 +175,7 @@ Remaining sequence:
 
 P6: native online operations — [ADR-0006](../adr/0006-online-resize-and-live-local-block-relocation.md)'s first slice (grow-notification + same-VG `pvmove` relocation) plus the hardening slice (the recorded backlog triage: the `grant_set` wedge design fix, the recorded test flakes and the campaign follow-up questions — each fixed or explicitly declined with a recorded reason).
 P7: packaging and distribution ([ADR-0009](../adr/0009-distribution-and-packaging.md)): deb/rpm artifacts, service units, release gates.
-P8: Tier V real-VMM verification ([ADR-0010](../adr/0010-tier-v-real-vmm-verification.md)); the engine-comparison consideration gate (compare Mayastor/io_uring/SPDK alternatives; only build a new engine when justified by measured gaps); the local-mirror experiment decision (design and fault on the real-host/media tier, or decline with a recorded reason).
+P8: Tier V real-VMM verification ([ADR-0010](../adr/0010-tier-v-real-vmm-verification.md), delivered in PR #27); the engine-comparison consideration gate — **decided: the gate is recorded closed** ([the methodology](../benchmarks/engine-comparison-methodology.md): compare Mayastor/io_uring/SPDK alternatives; only build a new engine when justified by measured gaps, and no measurements exist to carry a build decision); the local-mirror experiment — **decided: declined** ([ADR-0011](../adr/0011-local-mirror-experiment-decline.md), with the reopenable sketch). Both decisions delivered in PR #28.
 P9: Rook-cell device-sharing POC ([ADR-0008](../adr/0008-rook-only-hyperconverged-cells.md)'s lending surface and the three-physical-host scenarios).
 P10: separate managed-Ceph OSD placement ADR/implementation and production gate.
 
