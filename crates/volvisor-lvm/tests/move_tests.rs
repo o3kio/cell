@@ -36,20 +36,34 @@
 //!   that landed while the daemon was down parks `IN_DOUBT` on the
 //!   startup reconcile, and an `IN_DOUBT` record rolls forward when
 //!   the world later proves completion.
+//! - **The concurrency discipline** (the MAJOR review finding's
+//!   pins): two overlapping supervisions of one in-flight move — and
+//!   a retry reconcile whose snapshot predates a concurrent
+//!   completion — verify the same landed world and still bump the
+//!   generation exactly once.
 //!
-//! Test-kit code: `expect`/`unwrap` are allowed here by convention.
+//! Test-kit code: `expect`/`unwrap` are allowed here by convention,
+//! and the bounded-wait helpers fail loudly with `panic!` on their
+//! deadlines (the rig never hangs a suite).
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 mod common;
 
 use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use common::{
     CLAIMED_VG, MOVE_SOURCE_PV, MOVE_TARGET_PV, default_move_timing, fixture, move_fixture,
     move_fixture_with_timing, provider_from_with_timing, seed_move,
 };
+use volvisor_lvm::LvmProvider;
 use volvisor_lvm::state::{LvmState, MoveRecord};
+use volvisor_provider::FakeRunner;
 use volvisor_provider::VolumeProvider;
 use volvisor_provider::conformance::{fixture_attach_request, fixture_create_request};
 use volvisor_types::request::MoveVolumeBackingRequest;
@@ -1370,4 +1384,373 @@ async fn a_foreign_relocation_off_target_parks_in_doubt() {
         vec!["/dev/pv-c".to_owned()],
         "the foreign placement is untouched"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The concurrency discipline (the review findings' pins): one bump
+// under overlapping completions
+// ---------------------------------------------------------------------------
+
+/// Two consumer operations supervising the **same** in-flight move
+/// (the second re-attaches under its own operation id) both verify
+/// the landed relocation and both answer `COMPLETE` — and the
+/// generation bumps **exactly once**. Without the idempotency gate
+/// in `finish_complete`, whichever supervision completes second
+/// would bump again over the first's durable `COMPLETE` record.
+#[tokio::test]
+async fn two_overlapping_supervisions_of_one_move_bump_the_generation_exactly_once() {
+    let fixture = long_window_move_fixture();
+    let volume = "vol-move-two-supervisions";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // Hold the move so both operations attach and supervise before
+    // anything lands.
+    fixture.world.lock().expect("world").hold_moves = true;
+    let first = tokio::spawn({
+        let provider = Arc::clone(&fixture.provider);
+        let volume = volume_id(volume);
+        async move {
+            provider
+                .move_volume_backing(&volume, &move_request("op-move-1", MOVE_TARGET_PV, 1))
+                .await
+        }
+    });
+    // The first operation reached its supervision once its record is
+    // durably COPYING.
+    wait_for_record(&fixture.state_path, volume, |record| {
+        record.state == MoveVolumeBackingState::Copying
+    })
+    .await;
+
+    // The second operation re-attaches to the same in-flight move
+    // under its own operation id.
+    let second = tokio::spawn({
+        let provider = Arc::clone(&fixture.provider);
+        let volume = volume_id(volume);
+        async move {
+            provider
+                .move_volume_backing(&volume, &move_request("op-move-2", MOVE_TARGET_PV, 1))
+                .await
+        }
+    });
+    // The re-attach reached its supervision once its phase-4 COPYING
+    // save refreshed the record's operation id.
+    wait_for_record(&fixture.state_path, volume, |record| {
+        record.operation_id.as_str() == "op-move-2"
+    })
+    .await;
+
+    // Release the world: both supervisions observe the landing, both
+    // verify the same completed relocation — one bump, two honest
+    // COMPLETE answers.
+    fixture.world.lock().expect("world").hold_moves = false;
+    let first = first
+        .await
+        .expect("join first")
+        .expect("the first completes");
+    let second = second
+        .await
+        .expect("join second")
+        .expect("the re-attached second completes");
+    assert_eq!(first.state, MoveVolumeBackingState::Complete);
+    assert_eq!(second.state, MoveVolumeBackingState::Complete);
+    assert_eq!(first.generation, 2);
+    assert_eq!(second.generation, 2);
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    let record = record.expect("the record");
+    assert_eq!(record.state, MoveVolumeBackingState::Complete);
+    assert_eq!(record.source_pv, MOVE_SOURCE_PV);
+    assert_eq!(record.target_pv, MOVE_TARGET_PV);
+    assert_eq!(
+        generation, 2,
+        "two overlapping supervisions, exactly one generation bump"
+    );
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()]
+    );
+    // Two pvmove starts — the original and the re-attach's attach —
+    // never a third.
+    assert_eq!(pvmove_count(&fixture.runner), 2);
+}
+
+/// The retry reconcile's stale-snapshot race: the pass snapshots a
+/// `COPYING` record, a concurrent re-attach drive completes the
+/// record behind the snapshot's back, and the pass's own
+/// `finish_complete` then runs against the already-completed live
+/// record. The durable re-check under the state lock answers the
+/// stored `COMPLETE` record — the world-verified completion stays
+/// and the bump is **not** repeated. (Without the gate, the pass
+/// would bump a second time over the drive's completion.)
+///
+/// The interleaving is choreographed deterministically: the
+/// reconcile thread's first `lvs` observation parks (after its
+/// snapshot, before its classification) until the test releases it,
+/// so the drive provably completes between the snapshot and the
+/// pass's completion attempt.
+#[tokio::test]
+async fn a_reconcile_snapshot_from_before_the_completion_never_bumps_again() {
+    let fixture = move_fixture();
+    let volume = "vol-move-stale-snapshot";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // The dead incarnation's durable facts: a COPYING record and a
+    // live, held pvmove (the crash shape between the pvmove start
+    // and its landing).
+    seed_move(
+        &fixture.state_path,
+        volume,
+        MOVE_SOURCE_PV,
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::Copying,
+    );
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.moves.insert(
+            lv_path(volume),
+            common::FakeMove {
+                source: MOVE_SOURCE_PV.to_owned(),
+                target: MOVE_TARGET_PV.to_owned(),
+                percent: 0,
+            },
+        );
+        world.hold_moves = true;
+    }
+
+    // The retry reconcile runs on its own thread against a provider
+    // whose runner parks that thread's first `lvs` observation.
+    let pause = ReconcilePause::new();
+    let (provider, runner) = gated_provider(&fixture.state_path, &fixture.world, &pause);
+    let (thread_tx, thread_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel();
+    let (report_tx, report_rx) = mpsc::channel();
+    let reconcile = {
+        let provider = Arc::clone(&provider);
+        thread::spawn(move || {
+            thread_tx
+                .send(thread::current().id())
+                .expect("send the reconcile thread id");
+            go_rx.recv().expect("receive the go signal");
+            report_tx
+                .send(provider.move_reconcile_pass())
+                .expect("send the pass report");
+        })
+    };
+    // The pass snapshots COPYING, then parks at its world
+    // observation — before it classifies anything.
+    pause.arm(thread_rx.recv().expect("the reconcile thread id"));
+    go_tx.send(()).expect("release the reconcile thread");
+    pause.wait_until_paused();
+
+    // The re-attach drive completes the move behind the snapshot:
+    // attach to the held mirror, supervise, release the world, land,
+    // verify, ONE bump.
+    let drive = tokio::spawn({
+        let provider = Arc::clone(&provider);
+        let volume = volume_id(volume);
+        async move {
+            provider
+                .move_volume_backing(&volume, &move_request("op-drive", MOVE_TARGET_PV, 1))
+                .await
+        }
+    });
+    wait_for_record(&fixture.state_path, volume, |record| {
+        record.operation_id.as_str() == "op-drive"
+    })
+    .await;
+    fixture.world.lock().expect("world").hold_moves = false;
+    let response = drive
+        .await
+        .expect("join the drive")
+        .expect("the drive completes");
+    assert_eq!(response.state, MoveVolumeBackingState::Complete);
+    assert_eq!(response.generation, 2);
+
+    // The reconcile thread resumes: its snapshot said COPYING, the
+    // world now proves the relocation, and the LIVE record is
+    // already COMPLETE — the pass classifies it completed without a
+    // second bump.
+    pause.release();
+    reconcile.join().expect("join the reconcile thread");
+    let report = report_rx
+        .recv()
+        .expect("the pass report")
+        .expect("the pass");
+    assert_eq!(report.completed, vec![volume_id(volume)]);
+    assert_eq!(report.parked_in_doubt, Vec::new());
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    let record = record.expect("the record");
+    assert_eq!(record.state, MoveVolumeBackingState::Complete);
+    assert_eq!(record.source_pv, MOVE_SOURCE_PV);
+    assert_eq!(record.target_pv, MOVE_TARGET_PV);
+    assert_eq!(
+        generation, 2,
+        "the drive's completion bumped once; the stale-snapshot pass bumped nothing"
+    );
+    // The pass started no pvmove of its own: the drive's attach is
+    // the only one.
+    assert_eq!(pvmove_count(&runner), 1);
+}
+
+// ---------------------------------------------------------------------------
+// The concurrency rigs' helpers
+// ---------------------------------------------------------------------------
+
+/// Wait (bounded) until the volume's durable move record satisfies
+/// `predicate` — the state-file poll the concurrent tests use to
+/// observe a spawned drive's progress without touching provider
+/// internals.
+async fn wait_for_record(
+    state_path: &std::path::Path,
+    volume: &str,
+    predicate: impl Fn(&MoveRecord) -> bool,
+) {
+    for _ in 0..2_500 {
+        if let Some(record) = recorded_move(state_path, volume).0 {
+            if predicate(&record) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let (record, _) = recorded_move(state_path, volume);
+    panic!("the durable record never satisfied the predicate (last: {record:?})");
+}
+
+/// How many `pvmove` invocations a runner recorded.
+fn pvmove_count(runner: &FakeRunner) -> usize {
+    runner
+        .invocations()
+        .iter()
+        .filter(|invocation| invocation.program == "pvmove")
+        .count()
+}
+
+/// The reconcile-race choreography: a runner wrapper that parks the
+/// reconcile thread's `lvs` observations until the test releases
+/// them. The parked point is **after** the pass's record snapshot
+/// (the snapshot takes no world observation) and **before** its
+/// classification — the deterministic shape of the stale-snapshot
+/// race: a concurrent drive completes the record behind the
+/// snapshot's back while the pass is held.
+#[derive(Clone)]
+struct ReconcilePause {
+    inner: Arc<(Mutex<PauseState>, Condvar)>,
+}
+
+struct PauseState {
+    /// The thread whose `lvs` observations park (none until armed).
+    thread: Option<thread::ThreadId>,
+    /// The reconcile thread is parked at its observation.
+    paused: bool,
+    /// The test's release signal.
+    released: bool,
+}
+
+impl ReconcilePause {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new((
+                Mutex::new(PauseState {
+                    thread: None,
+                    paused: false,
+                    released: false,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    /// Arm the pause for `thread` (called once its id is known).
+    fn arm(&self, thread: thread::ThreadId) {
+        let mut state = self.inner.0.lock().expect("pause state");
+        state.thread = Some(thread);
+        self.inner.1.notify_all();
+    }
+
+    /// Park the armed thread's `lvs` observations (the runner calls
+    /// this before touching the world, so the test's drives keep
+    /// running while the reconcile thread is held).
+    fn pause_reconcile_thread(&self, program: &str) {
+        let mut state = self.inner.0.lock().expect("pause state");
+        if program != "lvs" || state.thread != Some(thread::current().id()) {
+            return;
+        }
+        state.paused = true;
+        self.inner.1.notify_all();
+        while !state.released {
+            state = self.inner.1.wait(state).expect("pause wait");
+        }
+    }
+
+    /// Block (bounded) until the armed thread is parked.
+    fn wait_until_paused(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut state = self.inner.0.lock().expect("pause state");
+        while !state.paused {
+            assert!(
+                Instant::now() < deadline,
+                "the reconcile thread never reached its parked observation"
+            );
+            let (guard, _) = self
+                .inner
+                .1
+                .wait_timeout(state, Duration::from_millis(50))
+                .expect("pause wait");
+            state = guard;
+        }
+    }
+
+    /// Release the parked thread.
+    fn release(&self) {
+        let mut state = self.inner.0.lock().expect("pause state");
+        state.released = true;
+        self.inner.1.notify_all();
+    }
+}
+
+/// A provider over the fixture's state file and world whose runner
+/// wraps the kit's script with the [`ReconcilePause`] choreography
+/// (plus the runner itself, for invocation assertions). The timing
+/// is the long-window shape: the drives under test must supervise
+/// well past the choreography's waits.
+fn gated_provider(
+    state_path: &std::path::Path,
+    world: &Arc<Mutex<common::FakeLvm>>,
+    pause: &ReconcilePause,
+) -> (Arc<LvmProvider>, Arc<FakeRunner>) {
+    let runner = {
+        let world = Arc::clone(world);
+        let pause = pause.clone();
+        Arc::new(FakeRunner::with_closure(move |program, args| {
+            pause.pause_reconcile_thread(program);
+            let mut world = world.lock().ok()?;
+            common::script(&mut world, program, args)
+        }))
+    };
+    let provider = LvmProvider::new(
+        Arc::clone(&runner) as Arc<dyn volvisor_provider::CommandRunner>,
+        state_path.to_path_buf(),
+        common::leak_tempdir(),
+        common::VG_PREFIX.to_owned(),
+        common::AUTH_TOKEN.to_owned(),
+    )
+    .map(|provider| {
+        Arc::new(
+            provider.with_move_timing(volvisor_lvm::provider::MoveTiming {
+                poll_interval: Duration::from_millis(5),
+                supervision_window: Duration::from_secs(30),
+            }),
+        )
+    })
+    .expect("provider construction");
+    (provider, runner)
 }

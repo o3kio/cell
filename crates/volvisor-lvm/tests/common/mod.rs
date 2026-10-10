@@ -221,7 +221,9 @@ fn report(key: &str, rows: &[serde_json::Value]) -> CommandOutput {
     CommandOutput::success(serde_json::json!({ "report": [{ key: rows }] }).to_string())
 }
 
-/// The `lvs` report rows for the simulated world.
+/// The `lvs` report rows for the simulated world (pass the query's
+/// `args` so later kit pieces can key on them — the kit's `script` is
+/// also public for tests that wrap it with their own choreography).
 ///
 /// Also the deterministic move clock: every `lvs` query advances each
 /// active move by [`FakeLvm::move_advance_percent`] (unless held), and
@@ -231,7 +233,7 @@ fn report(key: &str, rows: &[serde_json::Value]) -> CommandOutput {
 /// mid-move shape**: the `devices` column references the `pvmove0`
 /// mirror segment and `copy_percent` is empty (the progress lives on
 /// the hidden segment, not the LV row).
-fn lvs_report(world: &mut FakeLvm) -> CommandOutput {
+fn lvs_report(world: &mut FakeLvm, _args: &[&str]) -> CommandOutput {
     advance_moves(world);
     // The deceptive-completion knob's scheduled half: placements that
     // restore on this query, before the rows are reported.
@@ -413,15 +415,17 @@ fn pvs_report(world: &FakeLvm) -> CommandOutput {
     report("pv", &rows)
 }
 
-/// The scripted behavior for one command.
+/// The scripted behavior for one command. Public for tests that
+/// wrap the kit's world with their own runner-level choreography
+/// (e.g. a pause seam around the world lock).
 #[allow(clippy::too_many_lines)] // one arm per LVM verb — the kit's table
-fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOutput> {
+pub fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOutput> {
     match program {
         "lvs" => {
             if world.fail_lvs {
                 return Some(CommandOutput::failure("lvs: simulated failure"));
             }
-            Some(lvs_report(world))
+            Some(lvs_report(world, args))
         }
         "vgs" => {
             if world.fail_vgs {

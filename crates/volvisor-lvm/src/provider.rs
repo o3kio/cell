@@ -1084,6 +1084,15 @@ impl LvmProvider {
     /// A verification that cannot prove the source freed parks
     /// `IN_DOUBT` — the source extents are never declared freed on
     /// pvmove's word alone.
+    ///
+    /// **The bump is exactly once.** Two real callers can verify the
+    /// same landed world — two consumer re-attach POSTs supervising
+    /// one in-flight record, or the retry reconcile classifying a
+    /// snapshot taken before a concurrent drive completed the
+    /// record — so the durable record is re-checked under the state
+    /// lock: a stored `COMPLETE` record is the already-once
+    /// completion and is answered as-is, bumping nothing and saving
+    /// nothing.
     fn finish_complete(
         &self,
         volume_id: &VolumeId,
@@ -1113,6 +1122,20 @@ impl LvmProvider {
             );
         }
         let mut state = self.lock_state()?;
+        // The idempotency gate: this caller verified the world, but
+        // the completion may have landed durably between that
+        // observation and this lock. A stored COMPLETE record for
+        // the same source→target is the already-once completion —
+        // answer it without a second bump. A stored COMPLETE record
+        // for a *different* pair means this caller's record was
+        // superseded by a newer move's completion; the stored record
+        // is the durable truth, answered as-is — never clobbered,
+        // never re-bumped.
+        if let Some(stored_record) = state.move_record(volume_id) {
+            if stored_record.state == MoveVolumeBackingState::Complete {
+                return Ok(Self::move_response(&state, volume_id, stored_record));
+            }
+        }
         let Some(stored) = state.volume_mut(volume_id) else {
             // The volume was deleted while the move ran (the delete
             // path's own lvremove would have refused a moving LV, so
@@ -1194,7 +1217,14 @@ impl LvmProvider {
                 MoveVolumeBackingState::Complete => {
                     if record.target_pv == req.target_pool_id {
                         // Idempotent re-observation: this exact move
-                        // already completed.
+                        // already completed. The answer is the
+                        // durable record's **historical truth** — the
+                        // world is not re-observed here, so an
+                        // out-of-band post-completion `pvmove` back
+                        // to the source is not detected on this path
+                        // (fail-closed: a fresh operation with a
+                        // different target re-derives the world; the
+                        // record, never a guess, is the authority).
                         return Ok(MoveAdmission::Answered(Self::move_response(
                             &state, volume_id, record,
                         )));
@@ -1696,6 +1726,7 @@ impl LvmProvider {
                 report.unobservable.push(volume_id);
                 continue;
             };
+
             if observation.moving {
                 // The move is alive (whether this daemon started it
                 // or a previous incarnation did): the record must say
