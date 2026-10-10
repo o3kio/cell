@@ -31,6 +31,7 @@ pub mod crash;
 pub mod domain;
 pub mod error;
 pub mod id;
+pub mod lending;
 pub mod request;
 pub mod state;
 
@@ -48,8 +49,13 @@ pub use domain::{
 };
 pub use error::{ApiError, ApiErrorBody, ApiErrorCode, INVALID_API_VERSION};
 pub use id::{
-    AttachmentId, DeviceId, HostId, ID_MAX_LEN, MigrationId, OperationId, PoolId, ProjectId,
-    VolumeId,
+    AttachmentId, CellId, DeviceId, HostId, ID_MAX_LEN, MigrationId, OperationId, PoolId,
+    ProjectId, VolumeId,
+};
+pub use lending::{
+    ClaimedBy, DeviceObservation, DeviceOwnershipResponse, DeviceSurfaceObservation, ForceReclaim,
+    LendDeviceRequest, LendState, QuarantineReason, QuarantineState, ReclaimDeviceAck,
+    ReclaimDeviceRequest, ResidueCheck, ResolveQuarantineRequest,
 };
 pub use request::{
     AccessModeRequest, AdoptVolumeRequest, AdoptVolumeResponse, CreateVolumeRequest,

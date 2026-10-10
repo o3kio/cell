@@ -131,6 +131,11 @@ opaque_id!(
     /// Opaque migration transaction identity.
     MigrationId
 );
+opaque_id!(
+    /// Opaque storage-cell identity (the rook-cell contract's borrower
+    /// of a lent device; never a Kubernetes node name).
+    CellId
+);
 
 #[cfg(test)]
 mod tests {
