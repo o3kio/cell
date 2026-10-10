@@ -751,7 +751,7 @@ fn save_state_atomic(
 }
 
 /// The `<path>.tmp` sibling used for atomic saves.
-fn sibling_tmp_path(path: &Path) -> PathBuf {
+pub(crate) fn sibling_tmp_path(path: &Path) -> PathBuf {
     let mut os_name = path.as_os_str().to_owned();
     os_name.push(".tmp");
     PathBuf::from(os_name)
@@ -759,7 +759,7 @@ fn sibling_tmp_path(path: &Path) -> PathBuf {
 
 /// Create (or truncate) `path` for writing with owner-only
 /// permissions (`0600` on unix; the platform default elsewhere).
-fn create_owner_only(path: &Path) -> std::io::Result<fs::File> {
+pub(crate) fn create_owner_only(path: &Path) -> std::io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
