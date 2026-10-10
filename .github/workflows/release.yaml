@@ -1,0 +1,312 @@
+name: release
+
+# The release pipeline (P7-C, ADR-0009).
+#
+# On a `v*` tag: gates -> certification -> build -> container smokes ->
+# GitHub release carrying the artifacts, SHA256SUMS, and release notes
+# that embed the campaign certification for the exact tagged commit.
+#
+# On workflow_dispatch (any branch): the identical graph minus the
+# publish step, so the pipeline is provable before any tag exists.
+#
+# Provenance per ADR-0009: signed git tags + SHA256SUMS (the packages
+# themselves are not signed; that infrastructure is out of P7 scope).
+# The build job records the exact toolchain in BUILD_INFO.txt.
+#
+# Honest scope, recorded rather than hidden: the container smokes run
+# without systemd as PID 1, so they verify installation, version
+# stamps, --check-config on the shipped example configs, the shipped
+# layout, and systemd-analyze verify of the installed units — but not
+# unit START (that was verified against a real systemd in P7-B's
+# sandbox smoke and is not re-proven here). No upgrade/downgrade
+# transitions are tested. One architecture is built:
+# x86_64-unknown-linux-gnu.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+permissions:
+  contents: read
+
+jobs:
+  # The same gate set ci.yaml enforces per change (check + the LVM
+  # feature surface), re-run for the exact release commit. This job
+  # duplicates ci.yaml's steps deliberately: a release must not
+  # depend on whichever CI run happened to precede the tag, and the
+  # duplication is two short jobs against a fragile composite.
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy -p volvisor-lvm --features integration-lvm --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo doc --no-deps --document-private-items
+      - name: Real-LVM integration suite (ci.yaml parity)
+        run: |
+          sudo apt-get update && sudo apt-get install -y lvm2
+          sudo -E env "PATH=$PATH" VOLVISOR_TEST_LVM=1 cargo test -p volvisor-lvm --features integration-lvm
+
+  # ADR-0009's release gate: the campaign certification for the exact
+  # commit, over freshly emitted evidence — the suite re-emits the
+  # evidence tree at this HEAD, then campaign-summary checks it as a
+  # process exit code. The rendered record is embedded in the release
+  # notes by the release job.
+  certification:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fresh certification for this exact commit
+        run: |
+          set -eu
+          rm -rf target/campaign-evidence
+          cargo test -q --workspace
+          cargo run -q -p volvisor-campaign --bin campaign-summary -- --all --check
+      - name: Render the certification record
+        run: |
+          set -eu
+          commit=$(git rev-parse HEAD)
+          describe=$(git describe --tags --always --dirty)
+          {
+            echo "## Campaign certification"
+            echo
+            echo "\`campaign-summary --all --check\` exited 0 over a fresh"
+            echo "evidence run at commit \`$commit\` (\`$describe\`) — the"
+            echo "P5 completion gates (CG1–CG5) as a process exit code,"
+            echo "per ADR-0009's release gate."
+          } > certification-summary.md
+          cargo run -q -p volvisor-campaign --bin campaign-summary -- --all > certification-report.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: certification
+          path: |
+            certification-summary.md
+            certification-report.md
+
+  # Release artifacts from the git checkout (so the P7-A version
+  # stamp is a real describe; fetch-depth: 0 keeps tags reachable to
+  # it). Package and binary versions are forced to agree before
+  # anything is packaged.
+  build:
+    needs: [gates, certification]
+    runs-on: ubuntu-latest
+    outputs:
+      describe: ${{ steps.stamp.outputs.describe }}
+      version: ${{ steps.stamp.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the release binaries (x86_64-unknown-linux-gnu)
+        run: cargo build --release -p volvisord --bins
+      - name: Assert the binary stamp and derive the package version
+        id: stamp
+        run: |
+          set -eu
+          describe=$(git describe --tags --always --dirty)
+          # The compiled-in stamp must be this checkout's own describe:
+          # package and binary then carry one version discipline
+          # (packaging/package-version.sh documents the deb/rpm
+          # sanitization of the same describe).
+          test "$(./target/release/volvisord --version)" = "volvisord $describe"
+          test "$(./target/release/volvisor-witnessd --version)" = "volvisor-witnessd $describe"
+          version=$(./packaging/package-version.sh)
+          echo "describe=$describe" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Cache the packaging tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: packaging-tools-${{ runner.os }}-cargo-deb-3.8.0-cargo-generate-rpm-0.21.0
+      # Pinned for reproducible packaging; bump deliberately (the
+      # cache key above carries the same versions).
+      - name: Install the packaging tools
+        run: |
+          command -v cargo-deb >/dev/null 2>&1 || cargo install --locked --version 3.8.0 cargo-deb
+          command -v cargo-generate-rpm >/dev/null 2>&1 || cargo install --locked --version 0.21.0 cargo-generate-rpm
+      - name: Build the .deb
+        run: cargo deb -p volvisord --deb-version "${{ steps.stamp.outputs.version }}" --output "dist/volvisor_${{ steps.stamp.outputs.version }}_amd64.deb"
+      - name: Build the .rpm
+        run: cargo generate-rpm -p crates/volvisord -s 'version = "${{ steps.stamp.outputs.version }}"' -o dist/
+      - name: Bundle the release binaries
+        run: |
+          set -eu
+          version="${{ steps.stamp.outputs.version }}"
+          staged="volvisor-$version-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/$staged"
+          cp target/release/volvisord target/release/volvisor-witnessd "dist/$staged/"
+          cp LICENSE README.md "dist/$staged/"
+          tar -czf "dist/$staged.tar.gz" -C dist "$staged"
+      - name: Record the build provenance
+        run: |
+          set -eu
+          {
+            echo "Volvisor build record"
+            echo "====================="
+            echo "git commit:          $(git rev-parse HEAD)"
+            echo "git describe:        ${{ steps.stamp.outputs.describe }}"
+            echo "package version:     ${{ steps.stamp.outputs.version }}"
+            echo "target:              x86_64-unknown-linux-gnu (the only target this pipeline builds)"
+            echo "RUSTFLAGS:           $RUSTFLAGS"
+            echo "profile:             release (lto = thin, debug = line-tables-only; binaries ship as built, not stripped)"
+            echo
+            rustc -vV
+            echo
+            cargo --version
+            cargo-deb --version
+            cargo-generate-rpm --version
+            echo
+            uname -a
+            echo "built (UTC):         $(date -u)"
+          } > dist/BUILD_INFO.txt
+      - name: Checksum the artifacts
+        run: |
+          set -eu
+          cd dist
+          sha256sum volvisor_*_amd64.deb volvisor-*.x86_64.rpm volvisor-*.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist/
+
+  # The install smoke (packaging/smoke.sh, the same script verified
+  # locally): install the built package in a stock distro container
+  # and assert the shipped surface. Matrix containers run without
+  # systemd as PID 1 — see the workflow header for what that means.
+  smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        container: ["debian:stable", "fedora:latest"]
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
+    env:
+      DESCRIBE: ${{ needs.build.outputs.describe }}
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+      - name: Install and smoke the package
+        working-directory: dist
+        run: sh ../packaging/smoke.sh "$DESCRIBE" "$VERSION"
+
+  # Tag builds only. workflow_dispatch runs prove the graph without
+  # publishing anything.
+  release:
+    needs: [build, smoke]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: certification
+          path: certification
+      - name: Assemble the release notes
+        run: |
+          set -eu
+          {
+            echo "Volvisor $VERSION"
+            echo "================="
+            echo
+            echo "Volvisor is a prototype. This release is a distribution"
+            echo "fact, not a production-support claim: nothing here asserts"
+            echo "readiness for production service (ADR-0009 non-goal), and no"
+            echo "support commitment accompanies the artifacts."
+            echo
+            cat certification/certification-summary.md
+            echo
+            echo "## Artifacts"
+            echo
+            echo '- `volvisor_'"$VERSION"'_amd64.deb` — Debian/Ubuntu package'
+            echo '- `volvisor-'"$VERSION"'-1.x86_64.rpm` — EL/Fedora package'
+            echo '- `volvisor-'"$VERSION"'-x86_64-unknown-linux-gnu.tar.gz` — both release binaries'
+            echo '- `SHA256SUMS` — checksums over the above; verify with `sha256sum -c SHA256SUMS`'
+            echo '- `BUILD_INFO.txt` — the exact toolchain and build environment'
+            echo
+            echo "Both packages carry \`volvisord\` and \`volvisor-witnessd\`, their"
+            echo "systemd units, and annotated example configurations at"
+            echo "\`/etc/volvisor/\`. Nothing is enabled or started automatically;"
+            echo "see \`/usr/share/doc/volvisor/packaging.md\` (installed with the"
+            echo "package) for the enable steps and the verification boundary."
+            echo
+            echo "## Dependency reality"
+            echo
+            echo "- \`lvm2\` is a hard dependency of both packages."
+            echo "- \`drbd-utils\` (>= 9) is recommended, not required. The DRBD 9"
+            echo "  kernel module is a separate reality the package documents"
+            echo "  rather than pretends: Debian and SLES ship 9.x modules in"
+            echo "  their kernels; RHEL-family systems need a module from"
+            echo "  ELRepo or LINBIT. Without a DRBD 9 module, nearline"
+            echo "  replication providers fail closed — they do not degrade."
+            echo "- \`ceph-common\` is optional (the ceph provider shells out to"
+            echo "  \`rbd\` only when configured)."
+            echo
+            echo "## What this release did and did not verify"
+            echo
+            echo "Verified by this pipeline: the full gate set (fmt, clippy on"
+            echo "both feature sets, the workspace test suite, cargo doc, the"
+            echo "real-LVM integration suite) and the campaign certification on"
+            echo "this exact commit; installation of both packages in stock"
+            echo "\`debian:stable\` and \`fedora:latest\` containers with dependency"
+            echo "resolution, both binaries' version stamps, --check-config"
+            echo "against the shipped example configs, the shipped file layout,"
+            echo "and systemd-analyze verify of the installed units."
+            echo
+            echo "Not verified (recorded, not skipped): unit START in the"
+            echo "container smokes — the containers do not run systemd as PID"
+            echo "1; that path was verified against a real systemd in P7-B's"
+            echo "sandbox smoke and is not re-proven per release. No package"
+            echo "upgrade/downgrade transitions. A single architecture"
+            echo "(x86_64-unknown-linux-gnu). The packages are not signed;"
+            echo "provenance is the signed git tag plus SHA256SUMS."
+            echo
+            echo "The full campaign report:"
+            echo
+            echo '<details><summary>certification-report.md</summary>'
+            echo
+            echo '```markdown'
+            cat certification/certification-report.md
+            echo '```'
+            echo
+            echo '</details>'
+          } > dist/release-notes.md
+      - name: Create the release (tag builds only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          cd dist
+          gh release create "$GITHUB_REF_NAME" \
+            "volvisor_${VERSION}_amd64.deb" \
+            volvisor-*.x86_64.rpm \
+            "volvisor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            SHA256SUMS BUILD_INFO.txt \
+            --title "Volvisor $VERSION" \
+            --notes-file release-notes.md
