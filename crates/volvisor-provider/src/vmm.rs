@@ -138,8 +138,21 @@ use crate::runner::{CommandOutput, CommandRunner, STDERR_EXCERPT_MAX_CHARS};
 /// not match one of these tokens surfaces typed (a dead VMM socket
 /// must never read as "no VM" — plan §3). Modeled on the verified
 /// surface; pinned against real `ch-remote` output by the
-/// `VOLVISOR_TEST_CH` campaign (a later slice).
-const NOT_FOUND_TOKENS: [&str; 4] = ["not found", "no vm", "not initialized", "vm not created"];
+/// `VOLVISOR_TEST_CH` campaign (a later slice). The
+/// `"vm is not created"` token is the Tier V empirical pin
+/// (ADR-0010, P8-A): a live cloud-hypervisor v43.0.0 with no VM
+/// answers `info` with HTTP 500 and the body text `VM is not
+/// created`, which none of the doc-derived tokens match — without
+/// the pin, the empty-VMM shape (the restore target's steady state)
+/// surfaced as a typed `INTERNAL` instead of `Absent` and the
+/// re-drive safety rules could not observe absence.
+const NOT_FOUND_TOKENS: [&str; 5] = [
+    "not found",
+    "no vm",
+    "not initialized",
+    "vm not created",
+    "vm is not created",
+];
 
 /// The per-call budget of the resize-disk HTTP exchange (the module
 /// docs' resize-disk exception): the same order as the control-path
