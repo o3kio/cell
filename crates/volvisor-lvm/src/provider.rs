@@ -166,6 +166,21 @@ impl MoveObservation {
             && self.devices[0] == target_pv
             && source_pv != target_pv
     }
+
+    /// The verified-rollback proof: no move is active and the LV's
+    /// extents sit on **exactly the record's source PV** — the
+    /// pre-move placement. The relocation verifiably did not happen
+    /// (an out-of-band `pvmove --abort` that completed the rollback,
+    /// or a move that never started), so a parked `IN_DOUBT` record
+    /// may resolve `FAILED` with the source intact and serving. The
+    /// mixed-placement world (segments on both PVs — the honest
+    /// shape of LVM 2.03.x's non-atomic abort) is **not** this and
+    /// stays parked: it is genuinely unresolvable by observation
+    /// alone.
+    #[must_use]
+    pub(crate) fn restored_to_source(&self, source_pv: &str) -> bool {
+        !self.moving && self.devices.len() == 1 && self.devices[0] == source_pv
+    }
 }
 
 /// One `move_reconcile_pass` outcome report (the retry task logs it;
@@ -179,6 +194,10 @@ pub struct MoveReconcileReport {
     pub marked_copying: Vec<VolumeId>,
     /// Records parked `IN_DOUBT` (the move ended without relocating).
     pub parked_in_doubt: Vec<VolumeId>,
+    /// Records resolved `FAILED` by this pass: a parked `IN_DOUBT`
+    /// whose world verifiably shows the pre-move placement (the
+    /// relocation did not happen; the source intact and serving).
+    pub resolved_failed: Vec<VolumeId>,
     /// PREPARING records whose `pvmove` was (re-)started this pass.
     pub redriven: Vec<VolumeId>,
     /// Records dropped (their volume no longer exists).
@@ -1177,8 +1196,10 @@ impl LvmProvider {
     /// generation fence, the lifecycle admission, and the existing
     /// record's shape (an idempotent re-observation answers; an
     /// active move to the same target re-attaches; a different
-    /// target or an `IN_DOUBT` park refuses). Nothing is journaled
-    /// and nothing in the world is touched here.
+    /// target or an `IN_DOUBT` park refuses; a `FAILED` resolution
+    /// admits a fresh drive under the new operation; a mirror-path
+    /// state is refused typed as foreign to this journal). Nothing
+    /// is journaled and nothing in the world is touched here.
     fn admit_move(
         &self,
         volume_id: &VolumeId,
@@ -1268,11 +1289,41 @@ impl LvmProvider {
                             .map_or_else(String::new, |detail| format!(": {detail}"))
                     ),
                 )),
-                _ => Ok(MoveAdmission::Drive {
-                    vg_name: names.0,
-                    lv_name: names.1,
-                    existing_target: None,
-                }),
+                MoveVolumeBackingState::Failed => {
+                    // A resolved failure is terminal for **that
+                    // move** only: the reconcile proved the extents
+                    // verifiably sit back on the record's source (the
+                    // relocation did not happen), so a fresh request
+                    // re-derives the world and drives a new move;
+                    // the drive's PREPARING journal write supersedes
+                    // this record durably.
+                    Ok(MoveAdmission::Drive {
+                        vg_name: names.0,
+                        lv_name: names.1,
+                        existing_target: None,
+                    })
+                }
+                // `MIRROR_READY`/`PIVOTED` are mirror-path states
+                // this same-VG implementation never writes (the
+                // kernel-internal mirror is not `lvs`-observable,
+                // and a same-VG extent move never pivots). A record
+                // holding one is foreign to this provider's journal:
+                // refuse typed rather than silently superseding a
+                // state the provider cannot even observe.
+                MoveVolumeBackingState::MirrorReady | MoveVolumeBackingState::Pivoted => {
+                    Err(ApiError::new(
+                        ApiErrorCode::Internal,
+                        format!(
+                            "the volume's move record holds {} — a mirror-path state the \
+                             same-VG extent move never writes; the record is foreign to \
+                             this provider's journal, refusing rather than superseding it",
+                            match record.state {
+                                MoveVolumeBackingState::MirrorReady => "MIRROR_READY",
+                                _ => "PIVOTED",
+                            }
+                        ),
+                    ))
+                }
             },
         }
     }
@@ -1686,7 +1737,10 @@ impl LvmProvider {
     ///
     /// Never destructive: an unobservable record is skipped (retried
     /// next tick), an unrelocated `COPYING` record parks `IN_DOUBT`,
-    /// and nothing but a verified relocation ever completes.
+    /// a parked `IN_DOUBT` record whose world verifiably shows the
+    /// pre-move placement resolves `FAILED` (the known rollback
+    /// outcome; the mixed-placement park stays parked), and nothing
+    /// but a verified relocation ever completes.
     fn reconcile_moves(&self, redrive: bool) -> Result<MoveReconcileReport, ApiError> {
         let mut report = MoveReconcileReport::default();
         let snapshot: Vec<(VolumeId, crate::state::MoveRecord)> = {
@@ -1782,10 +1836,61 @@ impl LvmProvider {
                     )?;
                     report.parked_in_doubt.push(volume_id);
                 }
+                MoveVolumeBackingState::InDoubt
+                    if observation.restored_to_source(&record.source_pv) =>
+                {
+                    // The rollback direction's exit (the helper owns
+                    // the live-record re-check and the journal).
+                    self.resolve_in_doubt_rollback(&volume_id, &record, &mut report)?;
+                }
                 _ => {}
             }
         }
         Ok(report)
+    }
+
+    /// The rollback direction's exit: a parked record whose world
+    /// verifiably shows the pre-move placement (exactly the record's
+    /// source PV, no move active) resolves `FAILED` — the known
+    /// outcome: the relocation verifiably did not happen (an
+    /// out-of-band `pvmove --abort` that completed the rollback, or
+    /// a move that never started), the source is intact and serving,
+    /// and a fresh operation may drive a new move. The
+    /// mixed-placement world still parks (reached by no arm): it is
+    /// genuinely unresolvable by observation alone.
+    ///
+    /// The live record is re-checked under the lock — the same
+    /// stale-snapshot discipline as `finish_complete`: a record that
+    /// rolled forward to `COMPLETE` (or was superseded) behind this
+    /// pass's snapshot is the durable truth and is never overwritten
+    /// with a resolution.
+    fn resolve_in_doubt_rollback(
+        &self,
+        volume_id: &VolumeId,
+        record: &crate::state::MoveRecord,
+        report: &mut MoveReconcileReport,
+    ) -> Result<(), ApiError> {
+        let mut state = self.lock_state()?;
+        let resolves = state.move_record(volume_id).is_some_and(|stored| {
+            stored.state == MoveVolumeBackingState::InDoubt
+                && stored.source_pv == record.source_pv
+                && stored.target_pv == record.target_pv
+        });
+        if resolves {
+            if let Some(stored) = state.move_record_mut(volume_id) {
+                stored.state = MoveVolumeBackingState::Failed;
+                stored.detail = Some(format!(
+                    "resolved FAILED by reconciliation: the move to {} verifiably did \
+                     not happen — the extents sit on the source PV {} with no move \
+                     active (an out-of-band pvmove --abort completed the rollback, or \
+                     the move never started); the source is intact and serving",
+                    record.target_pv, record.source_pv
+                ));
+            }
+            self.persist(&mut state)?;
+            report.resolved_failed.push(volume_id.clone());
+        }
+        Ok(())
     }
 
     /// One retry reconcile pass (the daemon's background task and

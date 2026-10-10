@@ -36,11 +36,14 @@
 //!   that landed while the daemon was down parks `IN_DOUBT` on the
 //!   startup reconcile, and an `IN_DOUBT` record rolls forward when
 //!   the world later proves completion.
-//! - **The concurrency discipline** (the MAJOR review finding's
-//!   pins): two overlapping supervisions of one in-flight move — and
-//!   a retry reconcile whose snapshot predates a concurrent
-//!   completion — verify the same landed world and still bump the
-//!   generation exactly once.
+//! - **The concurrency and resolution discipline** (the review
+//!   findings' pins): two overlapping supervisions of one in-flight
+//!   move — and a retry reconcile whose snapshot predates a
+//!   concurrent completion — verify the same landed world and still
+//!   bump the generation exactly once; a parked `IN_DOUBT` record
+//!   whose world verifiably shows the pre-move placement resolves
+//!   `FAILED` and admits a fresh drive, while the mixed-placement
+//!   abort stays parked.
 //!
 //! Test-kit code: `expect`/`unwrap` are allowed here by convention,
 //! and the bounded-wait helpers fail loudly with `panic!` on their
@@ -59,7 +62,7 @@ use std::time::{Duration, Instant};
 
 use common::{
     CLAIMED_VG, MOVE_SOURCE_PV, MOVE_TARGET_PV, default_move_timing, fixture, move_fixture,
-    move_fixture_with_timing, provider_from_with_timing, seed_move,
+    move_fixture_with_timing, provider_from, provider_from_with_timing, seed_move,
 };
 use volvisor_lvm::LvmProvider;
 use volvisor_lvm::state::{LvmState, MoveRecord};
@@ -1387,8 +1390,9 @@ async fn a_foreign_relocation_off_target_parks_in_doubt() {
 }
 
 // ---------------------------------------------------------------------------
-// The concurrency discipline (the review findings' pins): one bump
-// under overlapping completions
+// The concurrency and resolution discipline (the review findings'
+// pins): one bump under overlapping completions, the IN_DOUBT
+// rollback exit
 // ---------------------------------------------------------------------------
 
 /// Two consumer operations supervising the **same** in-flight move
@@ -1598,6 +1602,156 @@ async fn a_reconcile_snapshot_from_before_the_completion_never_bumps_again() {
     // The pass started no pvmove of its own: the drive's attach is
     // the only one.
     assert_eq!(pvmove_count(&runner), 1);
+}
+
+/// A parked `IN_DOUBT` record whose world verifiably shows the
+/// pre-move placement (exactly the record's source PV, no move
+/// active — an out-of-band `pvmove --abort` that completed the
+/// rollback) resolves `FAILED` on the retry pass: the known outcome,
+/// journaled with the typed reason, generation untouched — and a
+/// fresh operation is admitted, driving a new move that completes
+/// with exactly one bump.
+#[tokio::test]
+async fn an_in_doubt_record_whose_extents_verifiably_returned_to_the_source_resolves_failed() {
+    let fixture = move_fixture();
+    let volume = "vol-move-resolve-failed";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // The park: the record is IN_DOUBT and the world is the honest
+    // mixed-placement abort (segments on both PVs — genuinely
+    // unresolvable by observation), so the constructor's startup
+    // pass leaves it parked.
+    seed_move(
+        &fixture.state_path,
+        volume,
+        MOVE_SOURCE_PV,
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::InDoubt,
+    );
+    fixture.world.lock().expect("world").lv_devices.insert(
+        lv_path(volume),
+        vec![MOVE_SOURCE_PV.to_owned(), MOVE_TARGET_PV.to_owned()],
+    );
+    let restarted = provider_from(&fixture.state_path, &fixture.world);
+    let (record, _) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("record").state,
+        MoveVolumeBackingState::InDoubt,
+        "the mixed-placement park survives the startup pass"
+    );
+
+    // The world changes behind the park: the rollback completes (the
+    // extents verifiably sit on exactly the source PV again). The
+    // retry pass resolves the record FAILED with the typed reason —
+    // the relocation verifiably did not happen — bumping nothing.
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .lv_devices
+        .insert(lv_path(volume), vec![MOVE_SOURCE_PV.to_owned()]);
+    let report = restarted.move_reconcile_pass().expect("the pass");
+    assert_eq!(report.resolved_failed, vec![volume_id(volume)]);
+    assert_eq!(report.parked_in_doubt, Vec::new());
+    assert_eq!(report.completed, Vec::new());
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    let record = record.expect("the record");
+    assert_eq!(record.state, MoveVolumeBackingState::Failed);
+    assert!(
+        record
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("verifiably did not happen"),
+        "the resolution names the known outcome: {:?}",
+        record.detail
+    );
+    assert_eq!(generation, 1, "a resolution bumps nothing");
+
+    // The exit is real: a fresh operation is admitted under a new
+    // operation id, the FAILED record is superseded at the PREPARING
+    // journal write, and the fresh move completes with exactly one
+    // bump.
+    let response = restarted
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-fresh", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect("the fresh drive is admitted");
+    assert_eq!(response.state, MoveVolumeBackingState::Complete);
+    assert_eq!(response.generation, 2);
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()]
+    );
+}
+
+/// The mixed-placement abort stays parked: a record whose extents
+/// verifiably sit on **both** PVs (the honest shape of LVM 2.03.x's
+/// non-atomic `pvmove --abort`) is genuinely unresolvable by
+/// observation alone — the reconcile pass neither resolves it,
+/// re-parks it, nor bumps anything, and a fresh operation still
+/// refuses typed naming the park.
+#[tokio::test]
+async fn an_in_doubt_record_in_a_mixed_placement_world_stays_parked() {
+    let fixture = move_fixture();
+    let volume = "vol-move-mixed-park";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    seed_move(
+        &fixture.state_path,
+        volume,
+        MOVE_SOURCE_PV,
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::InDoubt,
+    );
+    fixture.world.lock().expect("world").lv_devices.insert(
+        lv_path(volume),
+        vec![MOVE_SOURCE_PV.to_owned(), MOVE_TARGET_PV.to_owned()],
+    );
+
+    let restarted = provider_from(&fixture.state_path, &fixture.world);
+    let report = restarted.move_reconcile_pass().expect("the pass");
+    assert_eq!(
+        report.resolved_failed,
+        Vec::new(),
+        "the mixed placement resolves nothing"
+    );
+    assert_eq!(report.parked_in_doubt, Vec::new());
+    assert_eq!(report.completed, Vec::new());
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    let record = record.expect("the record");
+    assert_eq!(record.state, MoveVolumeBackingState::InDoubt);
+    assert_eq!(generation, 1, "nothing was freed");
+
+    // Fail-closed for new work: the park still refuses typed.
+    let error = restarted
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-2", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("still parked");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+    assert!(
+        error.detail.contains("IN_DOUBT"),
+        "the refusal names the park: {error}"
+    );
 }
 
 // ---------------------------------------------------------------------------

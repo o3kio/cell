@@ -39,7 +39,10 @@
 //! - **the out-of-band abort while down** — the record `COPYING`,
 //!   the world aborted back to the source: the restart parks
 //!   `IN_DOUBT` and a fresh operation refuses typed, the source
-//!   intact, no bump.
+//!   intact, no bump — then the retry pass resolves the verified
+//!   rollback to `FAILED` and a fresh operation is admitted,
+//!   driving a new move to the same target (the park is an exit,
+//!   not a dead end).
 //!
 //! Every assertion reads the durable state file, the scripted
 //! world, or the HTTP surface — never provider internals. Every
@@ -1213,7 +1216,13 @@ async fn move_pass_killed_after_complete_save() {
 /// lands while it is down. The fresh incarnation parks `IN_DOUBT`
 /// (never a silent revert, never a generic failure), a fresh
 /// operation refuses typed naming the park, the source extents are
-/// intact, and the generation never bumped.
+/// intact, and the generation never bumped. Then the resolution —
+/// the retry pass observes the verified rollback (the extents
+/// verifiably back on the source, no move active) and resolves the
+/// record `FAILED` (the known outcome: the relocation did not
+/// happen), and a fresh operation is **admitted**, driving a new
+/// move to the same target with one pvmove and one bump: the park
+/// is an exit, not a dead end.
 #[tokio::test]
 async fn move_aborted_out_of_band_while_down() {
     let rig = MoveRig::new();
@@ -1269,6 +1278,52 @@ async fn move_aborted_out_of_band_while_down() {
         "the source extents are intact and serving"
     );
     assert_eq!(rig.pvmove_count(), 1, "no new pvmove for a refusal");
+
+    // The resolution: one retry pass (the runtime task's shape)
+    // observes the verified rollback and resolves the record FAILED
+    // — the known outcome, journaled with the typed reason, no bump.
+    let volume_id = VolumeId::new(VOLUME).expect("valid volume id");
+    let pass = tokio::task::spawn_blocking({
+        let provider = Arc::clone(&fresh.provider);
+        move || provider.move_reconcile_pass()
+    })
+    .await
+    .expect("the pass task")
+    .expect("the pass");
+    assert_eq!(pass.resolved_failed, vec![volume_id]);
+    let (record, generation) = rig.recorded_move();
+    let record = record.expect("the record");
+    assert_eq!(record.state, MoveVolumeBackingState::Failed);
+    assert!(
+        record
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("verifiably did not happen")),
+        "the resolution names the known outcome: {:?}",
+        record.detail
+    );
+    assert_eq!(generation, 2, "the resolution bumped nothing");
+
+    // The exit: a fresh operation is admitted and drives a new move
+    // to the same target — one pvmove, one bump, COMPLETE.
+    rig.lvm.lock().expect("world").hold_moves = false;
+    let (status, body) = move_call(&fresh, "op-move-3", 2).await;
+    assert_eq!(status, 200, "the fresh drive is admitted: {body}");
+    let value = body_json(&body);
+    assert_eq!(
+        value["state"], "COMPLETE",
+        "the fresh move completes: {body}"
+    );
+    assert_eq!(
+        value["generation"], 3,
+        "exactly one bump for the fresh move"
+    );
+    assert_eq!(rig.pvmove_count(), 2, "one new pvmove for the fresh drive");
+    assert_eq!(
+        rig.placement(),
+        vec![MOVE_TARGET_PV.to_owned()],
+        "the fresh move relocated the extents"
+    );
     fresh.stop().await;
 
     evidence
@@ -1285,9 +1340,18 @@ async fn move_aborted_out_of_band_while_down() {
             "a fresh operation refused typed (INVALID_STATE) naming the park",
         )
         .invariant(
-            "the source intact",
-            "the extents never left the source PV; the generation never bumped",
+            "the verified rollback resolves",
+            "the retry pass resolved the park to FAILED (the relocation verifiably did not \
+             happen; the source intact) with no bump, and a fresh operation was admitted",
         )
-        .outcome("parked: IN_DOUBT with the source intact (the operator resolves it)");
+        .invariant(
+            "the source intact",
+            "the extents never left the source PV until the fresh admitted move relocated \
+             them; the generation bumped exactly once for that move alone",
+        )
+        .outcome(
+            "parked: IN_DOUBT with the source intact, resolved FAILED by the verified \
+             rollback, then a fresh admitted drive completed it",
+        );
     evidence.finish_single_daemon(&rig.journal_dir);
 }

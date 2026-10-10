@@ -384,6 +384,14 @@ fn log_move_pass(
                     "move ended without relocating; parked IN_DOUBT with the source intact"
                 );
             }
+            for volume_id in &report.resolved_failed {
+                tracing::info!(
+                    kind = "move_reconcile",
+                    volume_id = %volume_id,
+                    "parked IN_DOUBT resolved FAILED: the relocation verifiably did not \
+                     happen (the extents back on the source, intact and serving)"
+                );
+            }
             for volume_id in &report.dropped {
                 tracing::info!(
                     kind = "move_reconcile",

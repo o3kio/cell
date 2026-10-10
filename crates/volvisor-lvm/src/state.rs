@@ -121,17 +121,22 @@ pub struct DeviceEntry {
 /// at any boundary of the move, and the kernel-side `pvmove` mirror
 /// plus this record are what survive. The record's state is the
 /// honest subset of [`MoveVolumeBackingState`] — `PREPARING`,
-/// `COPYING`, `COMPLETE`, `IN_DOUBT` — never `MIRROR_READY`/
-/// `PIVOTED` (mirror-path states; a same-VG extent move never
-/// pivots, the LV's dm identity is stable) and never `FAILED` (an
-/// unknown outcome is `IN_DOUBT`; deterministic rejections are typed
-/// errors, not states).
+/// `COPYING`, `COMPLETE`, `IN_DOUBT`, and `FAILED` written by the
+/// retry reconcile **alone** (the verified-rollback resolution of a
+/// parked `IN_DOUBT`: the extents verifiably back on the source, the
+/// relocation did not happen) — never `MIRROR_READY`/`PIVOTED`
+/// (mirror-path states; a same-VG extent move never pivots, the
+/// LV's dm identity is stable) and never `FAILED` from a drive (an
+/// unknown outcome is `IN_DOUBT`; deterministic rejections are
+/// typed errors, not states).
 ///
 /// Keyed by volume: at most one move record exists per volume. A
 /// `COMPLETE` record for the same source/target answers re-issues
 /// idempotently; an `IN_DOUBT` record parks further moves typed
-/// until reconciliation proves completion or an operator resolves
-/// it.
+/// until reconciliation proves completion, resolves the verified
+/// rollback, or an operator resolves it; a `FAILED` record admits a
+/// fresh drive (the new record supersedes it at the drive's
+/// `PREPARING` journal write).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoveRecord {
     /// The operation that started (or most recently re-attached to)
