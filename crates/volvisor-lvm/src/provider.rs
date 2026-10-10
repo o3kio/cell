@@ -110,6 +110,16 @@ const MOVE_SUPERVISION_WINDOW: Duration = Duration::from_secs(30);
 /// daemon's LVM path).
 pub const MOVE_RETRY_TICK: Duration = Duration::from_secs(5);
 
+/// How many consecutive world-observe failures the retry reconcile
+/// tolerates for one record before parking it `IN_DOUBT` (the
+/// unobservable-LV limbo bound). Without it, an out-of-band
+/// `lvremove` of a moving LV would leave its record retried forever
+/// with no surfaced state; at the bound the record parks with a
+/// typed reason naming the unobservable LV. The count is in-memory
+/// and per-incarnation — a daemon restart resets it, never the
+/// honesty of any single pass.
+const MOVE_OBSERVE_FAILURE_BOUND: u32 = 3;
+
 /// The move drive's timing knobs (the production defaults above,
 /// overridable for the deterministic fake world and the fault rows —
 /// never for a production daemon).
@@ -198,6 +208,11 @@ pub struct MoveReconcileReport {
     /// whose world verifiably shows the pre-move placement (the
     /// relocation did not happen; the source intact and serving).
     pub resolved_failed: Vec<VolumeId>,
+    /// Records parked `IN_DOUBT` at the unobservable-LV bound: the
+    /// world could not be observed for `MOVE_OBSERVE_FAILURE_BOUND`
+    /// consecutive passes, so the record surfaces instead of
+    /// silently spinning.
+    pub parked_unobservable: Vec<VolumeId>,
     /// PREPARING records whose `pvmove` was (re-)started this pass.
     pub redriven: Vec<VolumeId>,
     /// Records dropped (their volume no longer exists).
@@ -232,6 +247,12 @@ pub struct LvmProvider {
     /// The move drive's timing (production defaults; overridable for
     /// the deterministic fake world only).
     move_timing: MoveTiming,
+    /// Consecutive world-observe failures per move record, counted
+    /// by the retry reconcile against
+    /// [`MOVE_OBSERVE_FAILURE_BOUND`] (the unobservable-LV limbo
+    /// bound). In-memory and per-incarnation: it never persists, and
+    /// a successful observation clears it.
+    move_observe_failures: Mutex<BTreeMap<VolumeId, u32>>,
     state: Mutex<LvmState>,
 }
 
@@ -278,6 +299,7 @@ impl LvmProvider {
             expected_auth_token,
             store_crash: Arc::new(StoreCrashHooks::new()),
             move_timing: MoveTiming::default(),
+            move_observe_failures: Mutex::new(BTreeMap::new()),
             state: Mutex::new(state),
         };
         provider.reconcile()?;
@@ -1192,6 +1214,28 @@ impl LvmProvider {
     /// mid-move outcome parks `IN_DOUBT`; the window expiring with
     /// the move progressing answers `COPYING` (a truthful
     /// observation of this call, not a completion claim).
+    /// Count one more consecutive world-observe failure for a move
+    /// record (the unobservable-LV limbo bound's counter; advisory
+    /// only — a poisoned lock reports past the bound so the record
+    /// parks, the fail-closed direction, never spins).
+    fn bump_move_observe_failures(&self, volume_id: &VolumeId) -> u32 {
+        self.move_observe_failures
+            .lock()
+            .map_or(MOVE_OBSERVE_FAILURE_BOUND, |mut failures| {
+                let count = failures.entry(volume_id.clone()).or_insert(0);
+                *count += 1;
+                *count
+            })
+    }
+
+    /// Clear a record's consecutive world-observe failure count (a
+    /// successful observation, a completed record, or a dropped one).
+    fn clear_move_observe_failures(&self, volume_id: &VolumeId) {
+        if let Ok(mut failures) = self.move_observe_failures.lock() {
+            failures.remove(volume_id);
+        }
+    }
+
     /// Phase 1 — qualify a move request under the state lock: the
     /// generation fence, the lifecycle admission, and the existing
     /// record's shape (an idempotent re-observation answers; an
@@ -1735,8 +1779,9 @@ impl LvmProvider {
     /// never started is re-driven — the consumer's journaled intent
     /// resolved by the world, the migration-drive discipline).
     ///
-    /// Never destructive: an unobservable record is skipped (retried
-    /// next tick), an unrelocated `COPYING` record parks `IN_DOUBT`,
+    /// Never destructive: an unobservable record is skipped and
+    /// retried (parking `IN_DOUBT` at the consecutive-failure bound
+    /// so it surfaces), an unrelocated `COPYING` record parks `IN_DOUBT`,
     /// a parked `IN_DOUBT` record whose world verifiably shows the
     /// pre-move placement resolves `FAILED` (the known rollback
     /// outcome; the mixed-placement park stays parked), and nothing
@@ -1764,6 +1809,7 @@ impl LvmProvider {
                 let mut state = self.lock_state()?;
                 state.remove_move(&volume_id);
                 self.persist(&mut state)?;
+                self.clear_move_observe_failures(&volume_id);
                 report.dropped.push(volume_id);
                 continue;
             };
@@ -1772,13 +1818,26 @@ impl LvmProvider {
                 // moving on afterwards is a new move for a new
                 // consumer request, never a re-completion (and never
                 // a second generation bump).
+                self.clear_move_observe_failures(&volume_id);
                 continue;
             }
-            let Ok(observation) = self.observe_lv(&vg_name, &lv_name) else {
-                // Honest unknown: leave the record untouched,
-                // retry on the next pass.
-                report.unobservable.push(volume_id);
-                continue;
+            let observation = match self.observe_lv(&vg_name, &lv_name) {
+                Ok(observation) => {
+                    self.clear_move_observe_failures(&volume_id);
+                    observation
+                }
+                Err(error) => {
+                    // Honest unknown — but never an unbounded one:
+                    // the unobservable-world tail owns the bound.
+                    self.reconcile_unobservable_world(
+                        &volume_id,
+                        &vg_name,
+                        &lv_name,
+                        &error,
+                        &mut report,
+                    )?;
+                    continue;
+                }
             };
 
             if observation.moving {
@@ -1847,6 +1906,47 @@ impl LvmProvider {
             }
         }
         Ok(report)
+    }
+
+    /// The unobservable-world tail of one reconcile record: below
+    /// [`MOVE_OBSERVE_FAILURE_BOUND`] consecutive failures the
+    /// record is left untouched and the pass reports the honest
+    /// unknown; at the bound the record parks `IN_DOUBT` with a
+    /// typed reason (e.g. an out-of-band `lvremove` of the moving LV
+    /// would otherwise spin forever with no surfaced state); a
+    /// record already parked surfaces as parked without being
+    /// re-written.
+    fn reconcile_unobservable_world(
+        &self,
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        error: &ApiError,
+        report: &mut MoveReconcileReport,
+    ) -> Result<(), ApiError> {
+        let failures = self.bump_move_observe_failures(volume_id);
+        let already_parked = {
+            let state = self.lock_state()?;
+            state
+                .move_record(volume_id)
+                .is_some_and(|record| record.state == MoveVolumeBackingState::InDoubt)
+        };
+        if !already_parked && failures >= MOVE_OBSERVE_FAILURE_BOUND {
+            self.park_in_doubt(
+                volume_id,
+                format!(
+                    "the LV {vg_name}/{lv_name} has been unobservable for {failures} \\
+                     consecutive reconcile passes ({error}); the record parks instead of \\
+                     silently spinning — an operator must resolve the placement"
+                ),
+            )?;
+        }
+        if already_parked || failures >= MOVE_OBSERVE_FAILURE_BOUND {
+            report.parked_unobservable.push(volume_id.clone());
+        } else {
+            report.unobservable.push(volume_id.clone());
+        }
+        Ok(())
     }
 
     /// The rollback direction's exit: a parked record whose world

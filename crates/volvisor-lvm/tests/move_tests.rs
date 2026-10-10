@@ -43,7 +43,8 @@
 //!   bump the generation exactly once; a parked `IN_DOUBT` record
 //!   whose world verifiably shows the pre-move placement resolves
 //!   `FAILED` and admits a fresh drive, while the mixed-placement
-//!   abort stays parked.
+//!   abort stays parked; an LV unobservable across the bound parks
+//!   `IN_DOUBT` typed instead of silently spinning.
 //!
 //! Test-kit code: `expect`/`unwrap` are allowed here by convention,
 //! and the bounded-wait helpers fail loudly with `panic!` on their
@@ -1392,7 +1393,7 @@ async fn a_foreign_relocation_off_target_parks_in_doubt() {
 // ---------------------------------------------------------------------------
 // The concurrency and resolution discipline (the review findings'
 // pins): one bump under overlapping completions, the IN_DOUBT
-// rollback exit
+// rollback exit, the unobservable-LV bound
 // ---------------------------------------------------------------------------
 
 /// Two consumer operations supervising the **same** in-flight move
@@ -1751,6 +1752,121 @@ async fn an_in_doubt_record_in_a_mixed_placement_world_stays_parked() {
     assert!(
         error.detail.contains("IN_DOUBT"),
         "the refusal names the park: {error}"
+    );
+}
+
+/// The unobservable-LV bound (the `lvremove`-limbo fix): a moving
+/// record whose LV cannot be observed is retried honestly below the
+/// bound, parks `IN_DOUBT` with a typed reason at it (surfaced,
+/// never silently spinning), and — once the world becomes observable
+/// again with the move gone and the extents verifiably back on the
+/// source — resolves `FAILED` by the normal arms. The park is an
+/// exit from limbo, not a new dead end.
+#[tokio::test]
+async fn an_lv_unobservable_across_the_bound_parks_in_doubt_typed() {
+    let fixture = move_fixture();
+    let volume = "vol-move-unobservable-bound";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // The in-flight move (held — the daemon supervises it) whose
+    // world then goes dark: the dead incarnation's COPYING record
+    // plus the live mirror, then every lvs observation fails (the
+    // out-of-band `lvremove` shape).
+    seed_move(
+        &fixture.state_path,
+        volume,
+        MOVE_SOURCE_PV,
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::Copying,
+    );
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.moves.insert(
+            lv_path(volume),
+            common::FakeMove {
+                source: MOVE_SOURCE_PV.to_owned(),
+                target: MOVE_TARGET_PV.to_owned(),
+                percent: 0,
+            },
+        );
+        world.hold_moves = true;
+    }
+    let restarted = provider_from(&fixture.state_path, &fixture.world);
+    fixture.world.lock().expect("world").fail_lvs = true;
+
+    // Below the bound (failures one and two): the record is left
+    // untouched, each pass reports the honest unknown.
+    for failure in 1..=2 {
+        let report = restarted.move_reconcile_pass().expect("a below-bound pass");
+        assert_eq!(
+            report.unobservable,
+            vec![volume_id(volume)],
+            "consecutive failure {failure}"
+        );
+        assert_eq!(report.parked_unobservable, Vec::new());
+    }
+    let (record, _) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("record").state,
+        MoveVolumeBackingState::Copying,
+        "below the bound the record is left untouched"
+    );
+
+    // At the bound (the third consecutive unobservable pass): the
+    // record parks IN_DOUBT with the typed reason.
+    let report = restarted.move_reconcile_pass().expect("the third failure");
+    assert_eq!(report.parked_unobservable, vec![volume_id(volume)]);
+    assert_eq!(report.unobservable, Vec::new());
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    let record = record.expect("the record");
+    assert_eq!(record.state, MoveVolumeBackingState::InDoubt);
+    assert!(
+        record
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("unobservable"),
+        "the park names the unobservable LV: {:?}",
+        record.detail
+    );
+    assert_eq!(generation, 1, "an unobservable world bumps nothing");
+
+    // The park surfaces: a fresh operation refuses typed carrying
+    // the reason (the record is queryable, not spinning).
+    let error = restarted
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-2", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("the parked record refuses");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+    assert!(
+        error.detail.contains("unobservable"),
+        "the refusal carries the typed reason: {error}"
+    );
+
+    // The world becomes observable again with the move gone and the
+    // extents verifiably back on the source (the operator resolved
+    // the vanished LV): the next pass resolves FAILED — the
+    // convergence the park enables, never a dead end.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.fail_lvs = false;
+        world.moves.clear();
+    }
+    let report = restarted
+        .move_reconcile_pass()
+        .expect("the observable pass");
+    assert_eq!(report.resolved_failed, vec![volume_id(volume)]);
+    let (record, _) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("record").state,
+        MoveVolumeBackingState::Failed
     );
 }
 

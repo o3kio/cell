@@ -392,6 +392,14 @@ fn log_move_pass(
                      happen (the extents back on the source, intact and serving)"
                 );
             }
+            for volume_id in &report.parked_unobservable {
+                tracing::warn!(
+                    kind = "move_reconcile",
+                    volume_id = %volume_id,
+                    "move record parked IN_DOUBT at the unobservable-LV bound; an \
+                     operator must resolve the placement"
+                );
+            }
             for volume_id in &report.dropped {
                 tracing::info!(
                     kind = "move_reconcile",
