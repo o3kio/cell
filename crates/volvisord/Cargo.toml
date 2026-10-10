@@ -50,3 +50,106 @@ clap = { version = "4", default-features = false, features = ["derive", "std", "
 [dev-dependencies]
 tempfile = { workspace = true }
 volvisor-drbd-testkit = { workspace = true }
+
+# The .deb payload (P7-C, ADR-0009): one package carries both daemons,
+# their units, and the annotated example configs as the real config
+# paths the units reference. dpkg conffile semantics keep a fresh
+# install from clobbering an operator's config on upgrade: files under
+# /etc/ are conffiles automatically, so dpkg preserves local edits and
+# prompts on upstream changes, never silently overwrites. The units
+# ship as plain files — no maintainer scripts, nothing auto-enabled or
+# auto-started; the operator enables them per packaging/README.md
+# after configuring.
+#
+# The package version is NOT the Cargo version: release CI builds with
+# `cargo deb --deb-version <sanitized git describe>` so package and
+# binary stamps carry one version discipline (packaging/package-version.sh).
+#
+# The binaries must be listed explicitly ("target/release/" is a
+# cargo-deb convention it rewrites to the real target dir): an explicit
+# assets list replaces the ["$auto"] default that would otherwise carry
+# them. They ship exactly as Cargo built them — the workspace release
+# profile's `debug = "line-tables-only"` is deliberate, so nothing is
+# stripped on the way into the package.
+[package.metadata.deb]
+name = "volvisor"
+maintainer = "Volvisor Project"
+copyright = "The Volvisor project authors. Apache-2.0; the full text ships as /usr/share/doc/volvisor/LICENSE."
+extended-description = """\
+Volvisor is the volume virtualization and orchestration layer for O3K and
+CellHV: one managed block-volume API across native-local LVM volumes,
+DRBD-based nearline replication, and Ceph RBD images, preserving each
+backend's real locality, durability, and mobility semantics.
+.
+This package carries both daemons (volvisord, volvisor-witnessd), their
+systemd units, and annotated example configurations at /etc/volvisor/.
+The units are not enabled automatically; see
+/usr/share/doc/volvisor/packaging.md for the install and enable steps,
+the dependency realities (LVM is required; DRBD 9 utilities are
+recommended and need a DRBD 9 kernel module that Debian and SLES ship
+but RHEL-family systems must obtain separately; Ceph client tools are
+optional), and the verification boundary of the packaging itself.
+.
+Volvisor is a prototype. This package is a distribution fact, not a
+production-support claim; nothing here asserts readiness for production
+service."""
+depends = "lvm2"
+recommends = "drbd-utils (>= 9)"
+suggests = "ceph-common"
+section = "admin"
+priority = "optional"
+assets = [
+    ["target/release/volvisord", "usr/bin/", "755"],
+    ["target/release/volvisor-witnessd", "usr/bin/", "755"],
+    ["../../packaging/volvisord.service", "usr/lib/systemd/system/", "644"],
+    ["../../packaging/volvisor-witnessd.service", "usr/lib/systemd/system/", "644"],
+    ["../../examples/volvisor.toml", "etc/volvisor/volvisor.toml", "644"],
+    ["../../examples/witnessd.toml", "etc/volvisor/witnessd.toml", "644"],
+    ["../../docs/configuration.md", "usr/share/doc/volvisor/configuration.md", "644"],
+    ["../../packaging/README.md", "usr/share/doc/volvisor/packaging.md", "644"],
+    ["../../LICENSE", "usr/share/doc/volvisor/", "644"],
+]
+
+# The .rpm payload (P7-C, ADR-0009): the same files the .deb ships,
+# with RPM's own "don't clobber the operator" mechanism — the /etc
+# assets below carry config = "noreplace" (%config(noreplace)): rpm
+# installs a .rpmnew beside local edits instead of overwriting them.
+# Version discipline: release CI passes `-s 'version = "<sanitized
+# git describe>"'` so the rpm and the binaries carry one version
+# (packaging/package-version.sh); the Cargo version here is only the
+# fallback for unadorned local runs.
+#
+# Asset sources are workspace-root-relative (cargo-generate-rpm with
+# -p resolves from the current directory first). The binaries ship
+# exactly as Cargo built them (the release profile's
+# debug = "line-tables-only" is deliberate; nothing is stripped).
+[package.metadata.generate-rpm]
+name = "volvisor"
+release = "1"
+summary = "Volvisor volume virtualization daemon (volvisord and volvisor-witnessd)"
+vendor = "Volvisor Project"
+assets = [
+    { source = "target/release/volvisord", dest = "/usr/bin/volvisord", mode = "755" },
+    { source = "target/release/volvisor-witnessd", dest = "/usr/bin/volvisor-witnessd", mode = "755" },
+    { source = "packaging/volvisord.service", dest = "/usr/lib/systemd/system/volvisord.service", mode = "644" },
+    { source = "packaging/volvisor-witnessd.service", dest = "/usr/lib/systemd/system/volvisor-witnessd.service", mode = "644" },
+    { source = "examples/volvisor.toml", dest = "/etc/volvisor/volvisor.toml", mode = "644", config = "noreplace" },
+    { source = "examples/witnessd.toml", dest = "/etc/volvisor/witnessd.toml", mode = "644", config = "noreplace" },
+    { source = "docs/configuration.md", dest = "/usr/share/doc/volvisor/configuration.md", mode = "644", doc = true },
+    { source = "packaging/README.md", dest = "/usr/share/doc/volvisor/packaging.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/volvisor/LICENSE", mode = "644", doc = true },
+]
+
+# Dependency honesty per ADR-0009: LVM is the one hard runtime
+# dependency; DRBD 9 utilities are recommended (weak: the package
+# installs without them) — the DRBD 9 kernel module itself is a
+# separate reality the docs carry, not the dependency solver; the
+# Ceph client tools are optional.
+[package.metadata.generate-rpm.requires]
+lvm2 = "*"
+
+[package.metadata.generate-rpm.recommends]
+drbd-utils = ">= 9"
+
+[package.metadata.generate-rpm.suggests]
+ceph-common = "*"
