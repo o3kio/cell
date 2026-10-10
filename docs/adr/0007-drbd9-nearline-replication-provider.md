@@ -3,7 +3,7 @@
 Status: Proposed / prototype selection, NOT production acceptance
 Decision-accepted: pending (record acceptance date and accepting authority here)
 Date: 2026-10-09
-Related: [ADR-0003](0003-tiered-volume-virtualization.md), [ADR-0004](0004-nearline-replication-and-mobility.md), [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md), [nearline v2 contract](../../contracts/nearline-replication-v2.md), [R&D comparison](../research/replicated-async-rnd.md)
+Related: [ADR-0003](0003-tiered-volume-virtualization.md), [ADR-0004](0004-nearline-replication-and-mobility.md), [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md), [nearline v2 contract](../../contracts/nearline-replication-v2.md), [R&D comparison](../research/replicated-async-rnd.md), [engine-comparison methodology](../benchmarks/engine-comparison-methodology.md) (P8-B — the measured-gaps instrument that keeps the NO-GO below honest; recorded closed 2026-10-10, no measurements exist), [ADR-0011](0011-local-mirror-experiment-decline.md) (P8-C — R3's status: the local-mirror experiment is declined until a mirror exists to fault; the fault classes require real media)
 
 ## Decision
 
