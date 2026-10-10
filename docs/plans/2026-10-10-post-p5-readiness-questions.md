@@ -193,6 +193,20 @@ evidence status stated honestly:
 - the **Tier R real-host drive** — the 8 gates are scaffolded, skipped
   honestly, and fail loudly under `VOLVISOR_CAMPAIGN_TIER=R`.
 
+**Closing status (PR #30, 2026-10-10, updated after PR #31).** Every pin
+above reads resolved with its PR pointer — the wedge, both original
+flakes, the row-3 budget, the row-12b race, and the **shared
+operation-id namespace** hardening (F5 of PR #23's review, **resolved in
+PR #31**: derived peer ids render in the reserved `derived:` namespace,
+unreachable from the consumer surface, with typed refusals at every
+journaling consumer route) — **except two, listed so the backlog's close
+is honest, not silent**: the **Tier R real-host drive** (scaffolded and
+skipped honestly — hardware-gated, the same class as P9-B, its state
+carried by the campaign's gate records and the nearline §10 note); and
+the wedge resolution's **beyond-TTL re-mint follow-up** (a recorded
+remedy direction in the diagnosis doc, not shipped). The pins move,
+they never disappear.
+
 **Decision (D1):** the next phases are P6–P9 as defined in §6 (native
 online operations, packaging/distribution, the real-VMM verification tier,
 the Rook-cell device-sharing POC), with the old P6 (managed Ceph) renumbered

@@ -490,3 +490,76 @@ without an intrusive fork.
   production-support claim from any P6–P9 artifact (§0 above).
 - Distro repository hosting and package-signing infrastructure
   (ADR-0009's best-effort-later scope).
+
+## Terminal state (2026-10-10)
+
+The closing record: every deliverable stage of this plan is merged, and
+the one stage that is not deliverable in this environment says so below.
+Each stage's letter carries its own resolution notes inline; this section
+is the whole arc at one glance, so a reader of the plan does not
+reconstruct it from the per-stage notes. This section records — it
+asserts nothing the artifacts do not already carry.
+
+| Stage | PR(s) | Outcome | Evidence |
+|---|---|---|---|
+| P6-A hardening slice | #21–#23 | delivered | the flake fixes and the row-3 budget amendment (#21), the F1 lineage re-check (#22), the grant_set wedge fix — re-resolvable peer acts — with the campaign's rows 7–8 re-derived ([the diagnosis](2026-10-10-grant-set-wedge-diagnosis.md); the healed cells' records in the campaign suite's `rows_8_14.rs` and `summary.rs`) |
+| P6-B grow-notification | #20 | delivered | the `vm.resize-disk` path with the pinned version gate and the real `guest_notification_status` machine (`volvisor-provider`'s `grow_tests.rs` + the byte-exact `vmm_tests.rs`) |
+| P6-C same-VG pvmove | #24 | delivered | `MoveVolumeBackingOnline` end to end: 33 provider-semantics tests (`volvisor-lvm`'s `move_tests.rs`), 5 daemon rows (`volvisord`'s `move_e2e.rs`), the campaign's row 16 (`move_rows.rs`), the `VOLVISOR_TEST_LVM=1` integration quartet |
+| P7-A version/config | #19 | delivered | `--version` / `--check-config` surfaces, [configuration.md](../configuration.md) + the `examples/` configs, asserted in CI |
+| P7-B units + readiness | #25 | delivered | `packaging/volvisord.service` + `volvisor-witnessd.service`: `Type=notify`, `READY=1` only after startup reconciliation, hardening with omissions documented |
+| P7-C packaging + release CI | #26 | delivered | `.github/workflows/release.yaml` + `packaging/smoke.sh`: deb and rpm built, installed and smoke-tested in containers |
+| P8-A Tier V | #27 | delivered | the env-gated substrate and four bounded scenarios (`volvisor-campaign`'s `tier_v`), and the first recorded host run committed at [docs/evidence/tier-v/2026-10-10-devhost/REPORT.md](../evidence/tier-v/2026-10-10-devhost/REPORT.md) |
+| P8-B engine-comparison gate | #28 | decided — gate closed | [the methodology](../benchmarks/engine-comparison-methodology.md) §7: no benchmark can honestly run in this phase, so no new engine is built; the gate reopens only by executing the methodology on matched hardware |
+| P8-C local-mirror experiment | #28 | decided — declined | [ADR-0011](../adr/0011-local-mirror-experiment-decline.md), with the reopenable sketch in its appendix |
+| P9-A lending surface | #29 | delivered | the contract's six lending invariants, one daemon-level Tier S test each (`volvisor-api`'s `lending_tests`), the contract's operator shape and the implementation agreeing |
+| P9-B three-host POC | — | hardware-gated | the [POC README](../poc/rook-cells/README.md)'s not-run markers are the gate list; ADR-0008's decision list is unchanged |
+| P10 | — | not authorized | §5 above — gated on P9's outcome and a production-support decision no evidence yet carries |
+
+**In aggregate.** The phase delivered native-local online operations
+complete — ADR-0006's first slice whole: grow-notification (#20) and
+same-VG `pvmove` evacuation (#24), each with the durable-boundary fault
+discipline the P5 campaign established; the hardening slice that closed
+the recorded backlog's flakes, the F1 re-check and the grant_set wedge
+(#21–#23); packaging end-to-end — version/config surfaces, hardened
+systemd units whose readiness follows reconciliation, and deb + rpm
+artifacts built, installed and smoke-tested by release CI (#19, #25,
+#26); Tier V with a recorded real-VMM run on a devhost (#27); and the
+two P8 decisions recorded closed — the engine-comparison gate stays
+closed for want of honest measurements, and the local-mirror experiment
+is declined with its reopenable sketch (#28); and the device-lending
+surface of the rook-cell contract, daemon-tested to its six invariants
+(#29); and, after the closing record was first drafted, the shared
+operation-id namespace hardening (F5 of PR #23's review) landed as PR
+#31 — derived peer ids in a reserved, consumer-unreachable namespace.
+The workspace suite stands at 1046 tests, and the campaign
+certification (CG1–CG5) passed at every stage's head — the honesty
+rules of §0 held throughout: no artifact of P6–P9 claims production
+support, real-media durability, or anything else its evidence does not
+carry.
+
+**What remains gated, and the exact gates.** P9-B needs three physical
+hosts (KVM/IOMMU, one sacrificial NVMe controller each, an external
+Kubernetes control plane) — the POC README's not-run markers are the
+gate list, ADR-0008's decision list is unchanged, and the lending
+surface's real observation leg and the volvisord runtime wiring arrive
+with that work, not before it. The P8-A recorded follow-up: the resize
+scenario's notified leg needs a host whose Cloud Hypervisor carries the
+`vm.resize-disk` route (upstream by v51.0.0; the recorded run's v43.0.0
+predates it, and the refusal branch was recorded). The grant_set
+wedge's convergence horizon: a park that outlives the 60 s lease TTL
+spins honestly with no re-mint path — the remedy directions are
+recorded in the diagnosis doc, not shipped. One backlog pin the phase
+leaves open, recorded rather than silently dropped: the Tier R
+real-host drive (scaffolded, skipped honestly, hardware-gated — the
+campaign's gate records and the nearline §10 note carry its state). The
+shared operation-id namespace hardening (F5 of PR #23's review) was
+left open when this section was first drafted and is now **resolved in
+PR #31** — derived peer ids render in the reserved `derived:` namespace,
+unreachable from the consumer surface, with typed refusals at every
+journaling consumer route.
+
+**P10.** Not authorized by this plan (§5 above) and still not
+authorized by anything the phase produced: it is gated on P9's outcome
+and a production-support decision the evidence must carry. Nothing in
+P6–P9 changes that — by §0's rule, no artifact of this phase may carry
+the claim that would open it.

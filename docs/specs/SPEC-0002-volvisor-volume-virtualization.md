@@ -173,11 +173,11 @@ the previous numbering's items):
 
 Remaining sequence:
 
-P6: native online operations — [ADR-0006](../adr/0006-online-resize-and-live-local-block-relocation.md)'s first slice (grow-notification + same-VG `pvmove` relocation) plus the hardening slice (the recorded backlog triage: the `grant_set` wedge design fix, the recorded test flakes and the campaign follow-up questions — each fixed or explicitly declined with a recorded reason).
-P7: packaging and distribution ([ADR-0009](../adr/0009-distribution-and-packaging.md)): deb/rpm artifacts, service units, release gates.
+P6: native online operations — [ADR-0006](../adr/0006-online-resize-and-live-local-block-relocation.md)'s first slice (grow-notification + same-VG `pvmove` relocation) plus the hardening slice (the recorded backlog triage: the `grant_set` wedge design fix, the recorded test flakes and the campaign follow-up questions — each fixed or explicitly declined with a recorded reason). **Delivered** in PRs #20–#24 (grow-notification #20, the hardening slice #21–#23, same-VG `pvmove` relocation #24).
+P7: packaging and distribution ([ADR-0009](../adr/0009-distribution-and-packaging.md)): deb/rpm artifacts, service units, release gates. **Delivered** in PRs #19, #25 and #26.
 P8: Tier V real-VMM verification ([ADR-0010](../adr/0010-tier-v-real-vmm-verification.md), delivered in PR #27); the engine-comparison consideration gate — **decided: the gate is recorded closed** ([the methodology](../benchmarks/engine-comparison-methodology.md): compare Mayastor/io_uring/SPDK alternatives; only build a new engine when justified by measured gaps, and no measurements exist to carry a build decision); the local-mirror experiment — **decided: declined** ([ADR-0011](../adr/0011-local-mirror-experiment-decline.md), with the reopenable sketch). Both decisions delivered in PR #28.
-P9: Rook-cell device-sharing POC ([ADR-0008](../adr/0008-rook-only-hyperconverged-cells.md)'s lending surface and the three-physical-host scenarios).
-P10: separate managed-Ceph OSD placement ADR/implementation and production gate.
+P9: Rook-cell device-sharing POC ([ADR-0008](../adr/0008-rook-only-hyperconverged-cells.md)'s lending surface and the three-physical-host scenarios). **Delivered in part** (PR #29: the lending surface — the contract's six invariants daemon-tested, the operator shape and the implementation agreeing); the three-physical-host scenarios are hardware-gated (the POC's not-run markers are the gate list).
+P10: separate managed-Ceph OSD placement ADR/implementation and production gate. **Not authorized** (the post-P5 plan §5): gated on P9's outcome and a production-support decision the evidence must carry.
 
 Numbering note: the repo's historical phase labels P0–P5 (through the aggressive failure campaign) correspond to the previous numbering's P0–P4 — the repo's "P5" campaign is that numbering's P4 crash/failure item. The previous numbering's P5 (the engine-comparison consideration gate) is P8 above; its P6 (managed Ceph) is P10.
 
