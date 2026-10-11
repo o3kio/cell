@@ -894,7 +894,9 @@ pub(crate) fn move_hash(req: &MoveVolumeBackingRequest, volume_id: &VolumeId) ->
 // PR #23's review, pinned in the readiness plan §1).
 
 /// The reserved namespace marker every engine-derived identity
-/// carries: `derived:`.
+/// carries: `derived:` (the constant lives in `volvisor-types` — the
+/// shared leaf — so every derived-id derivation in the workspace
+/// renders the same bytes; see [`volvisor_types::DERIVED_OPERATION_ID_PREFIX`]).
 ///
 /// The journal's id space is shared between consumer-supplied
 /// `operation_id`s and ids the engine derives for its own acts
@@ -913,7 +915,7 @@ pub(crate) fn move_hash(req: &MoveVolumeBackingRequest, volume_id: &VolumeId) ->
 /// validation, because internal paths legitimately carry derived ids
 /// through consumer-shaped request types (the promote attach reuses
 /// [`AttachVolumeRequest`]).
-pub(crate) const DERIVED_ID_PREFIX: &str = "derived:";
+pub(crate) use volvisor_types::DERIVED_OPERATION_ID_PREFIX as DERIVED_ID_PREFIX;
 
 /// Whether an identity string lives in the engine-derived reserved
 /// namespace ([`DERIVED_ID_PREFIX`]).

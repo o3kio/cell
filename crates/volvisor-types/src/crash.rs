@@ -99,6 +99,12 @@ pub const STORE_LVM_STATE: &str = "lvm_state";
 /// journaled intent and its effect is what quarantines the
 /// device).
 pub const STORE_DEVICE_OWNERSHIP: &str = "device_ownership";
+/// See [`STORE_MIGRATION_RECORDS`]: the destination's
+/// peer-preparation store — one JSON file per migration (the
+/// prepare install, the per-participant device-path recordings,
+/// and the GrantSet re-issue attempt counter's bump are armed
+/// through this seam; the horizon remedy's durable boundaries).
+pub const STORE_PEER_PREPARATION: &str = "peer_preparation";
 
 /// One deterministic kill point inside a durable save (P5 plan
 /// §3.1).

@@ -4076,6 +4076,7 @@ async fn peer_grant_resolves_an_in_flight_intent_by_inspection() {
                 expected_generation: 1,
                 device_path: Some("/dev/drbd-by-res/vol-r1".to_owned()),
             }],
+            grant_attempt: 0,
             created_at: 1,
         })
         .expect("install preparation");
@@ -4314,6 +4315,7 @@ async fn peer_grant_reissues_a_recorded_failure_when_the_act_provably_landed() {
                 expected_generation: 1,
                 device_path: Some("/dev/drbd-by-res/vol-w2".to_owned()),
             }],
+            grant_attempt: 0,
             created_at: 1,
         })
         .expect("install preparation");

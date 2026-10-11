@@ -48,7 +48,7 @@ pub mod types;
 
 pub use coordinator::{
     BatchStep, Clock, HandoffDriver, MigrationCoordinator, barrier_operation_id,
-    batch_operation_id, void_barrier_operation_id,
+    batch_operation_id, grant_set_reissue_operation_id, void_barrier_operation_id,
 };
 pub use store::MigrationStore;
 pub use surface::{MigrationSurface, MobilityRequest, migration_not_enabled};

@@ -49,8 +49,8 @@ pub use domain::{
 };
 pub use error::{ApiError, ApiErrorBody, ApiErrorCode, INVALID_API_VERSION};
 pub use id::{
-    AttachmentId, CellId, DeviceId, HostId, ID_MAX_LEN, MigrationId, OperationId, PoolId,
-    ProjectId, VolumeId,
+    AttachmentId, CellId, DERIVED_OPERATION_ID_PREFIX, DeviceId, HostId, ID_MAX_LEN, MigrationId,
+    OperationId, PoolId, ProjectId, VolumeId,
 };
 pub use lending::{
     ClaimedBy, DeviceObservation, DeviceOwnershipResponse, DeviceSurfaceObservation, ForceReclaim,

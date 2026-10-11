@@ -286,6 +286,60 @@ pub fn batch_operation_id(
     derived_operation_id(migration_id, step.tag(), &volumes)
 }
 
+/// Derive the deterministic operation id for a GrantSet **re-issue**
+/// (attempt `n ≥ 1`) of one migration — the convergence-horizon
+/// remedy's fresh-grant id.
+///
+/// The original batch id ([`batch_operation_id`]) replays the
+/// recorded grant outcome forever — correct while the recorded grant
+/// is serviceable, and exactly the trap once its lease has lapsed
+/// (the deterministic id re-serves the expired grant on every
+/// re-drive). A re-issue therefore mints under a NEW id: the
+/// migration identity, the step, the **ordered** participant set and
+/// the journaled attempt counter, domain-separated, rendered in the
+/// reserved derived namespace (PR #31's discipline, the constant in
+/// `volvisor-types`) as `derived:mig-grant-set-r{attempt}-{16 hex}`.
+/// Determinism is the whole point: the attempt counter is journaled
+/// durably on the destination's preparation BEFORE the witness call,
+/// so a re-drive after a crash re-derives the same id and the
+/// witness journal replays (or first-executes) exactly that attempt —
+/// never a second grant for one attempt. Attempt 0 keeps the original
+/// bare id byte-identically: every in-flight journal recorded before
+/// this remedy must keep replaying.
+///
+/// # Errors
+/// `INTERNAL` only if the derived string failed identity validation
+/// (unreachable for the fixed tag and hex alphabet).
+pub fn grant_set_reissue_operation_id(
+    migration_id: &MigrationId,
+    participants: &[Participant],
+    attempt: u64,
+) -> Result<OperationId, ApiError> {
+    let volumes: Vec<&str> = participants.iter().map(|p| p.volume_id.as_str()).collect();
+    let mut hasher = Sha256::new();
+    hasher.update(b"volvisor.handoff.reissue.op.v1:");
+    hasher.update(migration_id.as_str().as_bytes());
+    hasher.update(b":");
+    hasher.update(BatchStep::GrantSet.tag().as_bytes());
+    hasher.update(b":");
+    hasher.update(volumes.join(",").as_bytes());
+    hasher.update(b":");
+    hasher.update(attempt.to_string().as_bytes());
+    let digest = hasher.finalize();
+    let hash16 = hex_prefix(&digest, 8);
+    let raw = format!(
+        "{}mig-{}-r{attempt}-{hash16}",
+        volvisor_types::DERIVED_OPERATION_ID_PREFIX,
+        BatchStep::GrantSet.tag()
+    );
+    OperationId::new(raw).map_err(|e| {
+        ApiError::new(
+            ApiErrorCode::Internal,
+            format!("derived re-issue operation id failed validation: {e}"),
+        )
+    })
+}
+
 /// Derive the deterministic per-volume operation id for a
 /// `RecordBarrier` call (the same discipline as
 /// [`batch_operation_id`], scoped to one volume).

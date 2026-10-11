@@ -17,6 +17,18 @@ use crate::error::ApiError;
 /// Maximum accepted identity length in bytes.
 pub const ID_MAX_LEN: usize = 128;
 
+/// The reserved prefix of every engine-derived operation id
+/// (`derived:`). The consumer-facing operations journal reserves this
+/// namespace (PR #31's discipline): derived ids carry it so they can
+/// never collide with a consumer-supplied one, and every journaling
+/// consumer route refuses a consumer-supplied id carrying it **before
+/// any journal write**. The constant lives here — the shared leaf —
+/// so every crate that mints derived ids (the api journal's mobility
+/// and peer-act ids, the handoff crate's GrantSet re-issue ids)
+/// renders the same bytes; the namespace is a workspace-wide
+/// property, not one journal's local convention.
+pub const DERIVED_OPERATION_ID_PREFIX: &str = "derived:";
+
 fn validate(kind: &str, raw: &str) -> Result<(), ApiError> {
     if raw.is_empty() {
         return Err(ApiError::invalid_request(format!(
