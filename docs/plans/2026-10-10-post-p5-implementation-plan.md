@@ -547,7 +547,7 @@ surface of the rook-cell contract, daemon-tested to its six invariants
 (#29); and, after the closing record was first drafted, the shared
 operation-id namespace hardening (F5 of PR #23's review) landed as PR
 #31 — derived peer ids in a reserved, consumer-unreachable namespace.
-The workspace suite stands at 1046 tests, and the campaign
+The workspace suite stands at 1047 tests, and the campaign
 certification (CG1–CG5) passed at every stage's head — the honesty
 rules of §0 held throughout: no artifact of P6–P9 claims production
 support, real-media durability, or anything else its evidence does not

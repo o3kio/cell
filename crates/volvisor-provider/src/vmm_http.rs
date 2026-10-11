@@ -399,6 +399,10 @@ mod tests {
         let response = put_json(
             &socket,
             "/api/v1/vm.resize-disk",
+            // hand-fed literal input (key order as written); the adapter-level
+            // pin in tests/vmm_tests.rs asserts the same body as serde_json
+            // actually serializes it (alphabetical map order) — both are the
+            // same v51.1 VmResizeDisk shape
             r#"{"id":"vol-1","desired_size":2048}"#,
             TIMEOUT,
         )
