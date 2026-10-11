@@ -1194,8 +1194,13 @@ async fn real_resize_notification(env: RealVmmEnv) -> PathBuf {
     let mut evidence = Evidence::new_tier_v("tier-v/resize-notification");
     evidence.components(env.components_value());
 
-    // ---- leg 1: the PROVEN version gate (37.0.0 ≤ the real
-    // binary's version) — the notification reaches the real VMM.
+    // ---- leg 1: the version gate at the ROUTE'S BOUNDARY — 51.0.0,
+    // below every live-verified route-carrying binary (v51.1) and
+    // above every live-verified route-absent one (v43.0.0; upstream
+    // v49.0's published OpenAPI already lacks the route, v50.0's
+    // carries it). Proven on a route-carrying binary, the
+    // notification reaches the real VMM; below the boundary the gate
+    // itself refuses — both honest, both recorded.
     let vmm: Arc<dyn VmmController> = Arc::new(real.source_vmm());
     let world = GrowWorld::new();
     let mut daemon = GrowDaemon::launch(
@@ -1203,7 +1208,7 @@ async fn real_resize_notification(env: RealVmmEnv) -> PathBuf {
         Arc::clone(&vmm),
         VmmVersionGate::probe(
             Some(&env.cloud_hypervisor),
-            Some("37.0.0"),
+            Some("51.0.0"),
             &RealRunner::default(),
         ),
     )
@@ -1240,11 +1245,13 @@ async fn real_resize_notification(env: RealVmmEnv) -> PathBuf {
         let reason = record.pending_reason().expect("pending with a reason");
         assert!(
             reason.contains("404") || reason.contains("refused"),
-            "the pending reason carries the real VMM's typed answer: {reason}"
+            "the pending reason carries the real refusal (the VMM's typed answer, or \
+             the gate's): {reason}"
         );
         // The retry pass re-drives the notification against the real
-        // VMM: the record stays retry_required (the route is still
-        // absent at this binary's version) — the honest durable
+        // VMM: the record stays retry_required (whatever refused —
+        // the route absent at this binary's version, or the gate
+        // below the boundary — refuses again) — the honest durable
         // state, observed rather than assumed.
         let report = daemon.engine.retry_pass().expect("the retry pass");
         assert!(
@@ -1281,7 +1288,7 @@ async fn real_resize_notification(env: RealVmmEnv) -> PathBuf {
     let world = daemon.world;
     let mut refused = GrowDaemon::launch(
         &world,
-        vmm,
+        Arc::clone(&vmm),
         VmmVersionGate::probe(
             Some(&env.cloud_hypervisor),
             Some("99.0.0"),
@@ -1314,6 +1321,58 @@ async fn real_resize_notification(env: RealVmmEnv) -> PathBuf {
         "the refused gate never reached the VMM"
     );
     refused.stop().await;
+    let world = refused.world;
+
+    // ---- leg 3 (when an older binary is claimed): the SAME
+    // boundary minimum probed against the legacy binary — a real
+    // binary below the boundary, so the gate is unproven and the
+    // notification is refused BEFORE any VMM call. The fail-closed
+    // cell of the boundary, recorded from a real --version output
+    // rather than a fabricated one.
+    if let Some(legacy) = &env.legacy_cloud_hypervisor {
+        let mut boundary = GrowDaemon::launch(
+            &world,
+            Arc::clone(&vmm),
+            VmmVersionGate::probe(Some(&legacy.path), Some("51.0.0"), &RealRunner::default()),
+        )
+        .await;
+        grow_disk_file(&disk_path, 4 * GIB);
+        let (status, body) = grow(&boundary, "op-grow-3", 4 * GIB, 4).await;
+        assert_eq!(status, 200, "the grow itself succeeds: {body}");
+        let value = body_json(&body);
+        assert_eq!(
+            value["guest_notification_status"],
+            json!("retry_required"),
+            "the boundary gate fails the notification closed against the older \
+             binary: {body}"
+        );
+        let record = boundary
+            .engine
+            .record(&volume_id())
+            .expect("the record")
+            .expect("the durable notification record exists");
+        let reason = record.pending_reason().expect("pending with a reason");
+        assert!(
+            reason.contains("version gate refused"),
+            "the boundary refusal names the gate (and the observed version): {reason}"
+        );
+        assert_eq!(
+            real.source_vmm().state(&vm).expect("the VM state"),
+            VmState::Running,
+            "the boundary refusal never reached the VMM"
+        );
+        boundary.stop().await;
+        evidence.invariant(
+            "version_gate_boundary_fails_closed_below_the_route",
+            &format!(
+                "pass: the same 51.0.0 boundary probed against the real legacy binary \
+                 ({} at {}) — unproven — refused the notification fail-closed before \
+                 any VMM call, the durable record carrying the gate's reason",
+                legacy.version,
+                legacy.path.display()
+            ),
+        );
+    }
 
     evidence.invariant(
         "notification_contract_both_ways",
@@ -1322,16 +1381,29 @@ async fn real_resize_notification(env: RealVmmEnv) -> PathBuf {
              the refused version gate fails closed before any VMM call"
         ),
     );
+    let legacy_clause = env
+        .legacy_cloud_hypervisor
+        .as_ref()
+        .map_or(String::new(), |legacy| {
+            format!(
+                ", and the same boundary unproven against the real legacy binary ({})",
+                legacy.version
+            )
+        });
     evidence.invariant(
         "version_gate_probed_from_the_real_binary",
-        "pass: both gate legs probed the real binary's --version output through the \
-         real runner (proven minimum 37.0.0, refused minimum 99.0.0)",
+        &format!(
+            "pass: every gate leg probed a real binary's --version output through the \
+             real runner (the run binary at the route's boundary 51.0.0 and the refused \
+             control 99.0.0{legacy_clause})"
+        ),
     );
-    evidence.outcome(
-        "complete: the P6 grow notification was driven against a real VMM — both \
-         version-gate legs probed from the real binary, the fail-closed retry contract, \
-         and the retry pass",
-    );
+    evidence.outcome(&format!(
+        "complete: the P6 grow notification was driven against a real VMM — the \
+         version gate at the route's boundary (51.0.0) and the refused control (99.0.0) \
+         probed from real --version output{legacy_clause}, the fail-closed retry \
+         contract, and the retry pass",
+    ));
     let logs = LogSources {
         a_journal: &world.journal_dir,
         b_journal: &world.journal_dir,

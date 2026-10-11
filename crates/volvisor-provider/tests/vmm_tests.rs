@@ -575,12 +575,13 @@ fn resize_disk_writes_the_exact_http_bytes_and_accepts_204() {
         "PUT /api/v1/vm.resize-disk HTTP/1.1\r\n\
          Host: localhost\r\n\
          Content-Type: application/json\r\n\
-         Content-Length: 36\r\n\
+         Content-Length: 40\r\n\
          Connection: close\r\n\
          \r\n\
-         {\"id\":\"vol-1\",\"new_size\":2147483648}",
+         {\"desired_size\":2147483648,\"id\":\"vol-1\"}",
         "the request bytes are pinned: method, path, headers and the \
-         VmResizeDisk body (id + new_size, slot omitted)"
+         VmResizeDisk body (desired_size + id — serde_json's map orders \
+         keys, and the v51.1 OpenAPI shape)"
     );
 }
 

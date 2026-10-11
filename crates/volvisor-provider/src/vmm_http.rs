@@ -4,15 +4,19 @@
 //!
 //! # Why hand-rolled
 //!
-//! The verified fact (checked against cloud-hypervisor v37.0's
-//! published command list): `ch-remote` has **no `resize-disk`
-//! subcommand**. Disk resize is REST-API-only — `PUT
+//! The verified bounds (checked against the published command
+//! lists and OpenAPI of both recorded generations): cloud-hypervisor
+//! v37.0's `ch-remote` has **no `resize-disk` subcommand** — the
+//! REST route itself is absent before v50.0 — while v51.1's
+//! `ch-remote` carries it as a thin client over the same route.
+//! The adapter speaks the REST route directly either way: `PUT
 //! /api/v1/vm.resize-disk` over the VMM's `--api-socket` unix
 //! socket, with the `VmResizeDisk` JSON body. The adapter object
 //! ([`crate::vmm::ChRemoteVmm`]) carries the capability, but the
 //! mechanism is this module's HTTP/1.1 exchange over the same socket
 //! the `ch-remote` commands target — no new dependency, exactly the
-//! request bytes the upstream schema pins.
+//! request bytes the upstream schema pins, and no dependence on
+//! which `ch-remote` generation the host happens to carry.
 //!
 //! # The exchange
 //!
@@ -395,7 +399,11 @@ mod tests {
         let response = put_json(
             &socket,
             "/api/v1/vm.resize-disk",
-            r#"{"id":"vol-1","new_size":2048}"#,
+            // hand-fed literal input (key order as written); the adapter-level
+            // pin in tests/vmm_tests.rs asserts the same body as serde_json
+            // actually serializes it (alphabetical map order) — both are the
+            // same v51.1 VmResizeDisk shape
+            r#"{"id":"vol-1","desired_size":2048}"#,
             TIMEOUT,
         )
         .expect("the exchange succeeds");
@@ -407,10 +415,10 @@ mod tests {
             "PUT /api/v1/vm.resize-disk HTTP/1.1\r\n\
              Host: localhost\r\n\
              Content-Type: application/json\r\n\
-             Content-Length: 30\r\n\
+             Content-Length: 34\r\n\
              Connection: close\r\n\
              \r\n\
-             {\"id\":\"vol-1\",\"new_size\":2048}"
+             {\"id\":\"vol-1\",\"desired_size\":2048}"
         );
     }
 

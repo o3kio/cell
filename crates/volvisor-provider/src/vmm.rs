@@ -332,10 +332,16 @@ pub trait VmmController: Send + Sync {
     /// Resize one disk of one VM through the VMM's resize-disk API
     /// (P6-B, ADR-0006 first slice part 1): `PUT
     /// /api/v1/vm.resize-disk` over the VM's api-socket with the
-    /// `VmResizeDisk` body — `{"id": <disk_id>, "new_size":
-    /// <new_size_bytes>}` (`slot` is optional in the schema and
-    /// omitted). The capacity-notification step of an online grow on
-    /// an attached volume.
+    /// `VmResizeDisk` body — `{"id": <disk_id>, "desired_size":
+    /// <new_size_bytes>}` — the shape pinned by cloud-hypervisor
+    /// v51.1's published OpenAPI (`id`, a disk identifier, +
+    /// `desired_size`, bytes) and verified live against the v51.1
+    /// binary (PR #32's recorded run; the first probe with the
+    /// pre-`desired_size` field name was refused with a typed 400,
+    /// the recorded API-drift finding — generations before v50.0
+    /// carry no route at all, so the older field name never reached
+    /// a real parser). The capacity-notification step of an online
+    /// grow on an attached volume.
     ///
     /// Re-drive-safe for the notification engine's retry: re-issuing
     /// the same (disk, size) is a no-op on the VMM side. The
@@ -600,11 +606,13 @@ impl VmmController for ChRemoteVmm {
     fn resize_disk(&self, vm_id: &str, disk_id: &str, new_size_bytes: u64) -> Result<(), ApiError> {
         // The module docs' resize-disk exception: REST-only, over the
         // same api-socket, with the VmResizeDisk body byte-pinned
-        // (the argv-exact discipline translated to HTTP bytes). The
-        // disk id is the attachment-recorded VMM device id (P6-B) —
-        // the body addresses the VMM's own device identity, never a
-        // host path.
-        let body = json!({ "id": disk_id, "new_size": new_size_bytes }).to_string();
+        // (the argv-exact discipline translated to HTTP bytes):
+        // {"id", "desired_size"} per cloud-hypervisor v51.1's
+        // published OpenAPI, verified live in the recorded v51.1 run
+        // (PR #32). The disk id is the attachment-recorded VMM
+        // device id (P6-B) — the body addresses the VMM's own device
+        // identity, never a host path.
+        let body = json!({ "id": disk_id, "desired_size": new_size_bytes }).to_string();
         let response = crate::vmm_http::put_json(
             &self.socket_path(vm_id),
             "/api/v1/vm.resize-disk",

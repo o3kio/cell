@@ -336,16 +336,32 @@ Cloud Hypervisor installed) or the tier's not-run state is itself recorded
 and visible; the nearline §10 ledger's Tier V line moves from "planned" to
 the delivered truth, whatever it is.
 
-**Recorded follow-up (from the delivered run).** The first recorded host
-run's binary (cloud-hypervisor v43.0.0) predates the upstream
-`vm.resize-disk` API route, so the resize scenario's notified leg is
-asserted by contract only (a 2xx means `notified`; a typed refusal means a
-durable `retry_required` carrying it) and the run recorded the refusal
-branch (HTTP 404). Follow-up, still P8-A scope: re-run the resize scenario
-on a host whose Cloud Hypervisor carries the route (upstream by v51.0.0),
-recording that binary's version and SHA256 in the run record's components,
-so the `notified` leg is recorded from a real observation too. This is NOT
-P8-B work — P8-B is the engine-comparison methodology, a different scope.
+**Recorded follow-up (from the delivered run) — RESOLVED in PR #32.**
+The first recorded host run's binary (cloud-hypervisor v43.0.0)
+predates the upstream `vm.resize-disk` API route, so the resize
+scenario's notified leg was asserted by contract only (a 2xx means
+`notified`; a typed refusal means a durable `retry_required` carrying
+it) and that run recorded the refusal branch (HTTP 404). PR #32
+resolved it: the scenario was re-run against the upstream v51.1
+release binary (downloaded from the release asset, pinned by its
+SHA256 cross-checked against the platform-published asset digest)
+and the `notified` leg is recorded from a real observation — the
+real `PUT /api/v1/vm.resize-disk` answered 2xx and the grow
+converged `notified`, with the version gate at the route's boundary
+(51.0.0) recorded both ways: proven against v51.1, and unproven
+against the same minimum probed on the real v43.0.0 binary —
+fail-closed before any VMM call. The re-run surfaced and fixed the
+adapter's request body (the pre-route field name; v51.1's pinned
+OpenAPI says `id` + `desired_size` in bytes — the live typed 400
+that exposed the drift is recorded as the run's finding). The
+second recorded run is committed under
+`docs/evidence/tier-v/2026-10-11-devhost-v51/`; the empirical
+bounds it leaves behind: v43.0.0 lacks the route (typed 404, first
+run), v51.1 carries it (notified, second run), and upstream's own
+pinned OpenAPI places the route's introduction between v49.0
+(absent) and v50.0 (present) — a document-verified bound between
+the two live-verified points. This was never P8-B work — P8-B is
+the engine-comparison methodology, a different scope.
 
 ### P8-B: the engine-comparison benchmark methodology and its decision gate
 
@@ -508,7 +524,7 @@ asserts nothing the artifacts do not already carry.
 | P7-A version/config | #19 | delivered | `--version` / `--check-config` surfaces, [configuration.md](../configuration.md) + the `examples/` configs, asserted in CI |
 | P7-B units + readiness | #25 | delivered | `packaging/volvisord.service` + `volvisor-witnessd.service`: `Type=notify`, `READY=1` only after startup reconciliation, hardening with omissions documented |
 | P7-C packaging + release CI | #26 | delivered | `.github/workflows/release.yaml` + `packaging/smoke.sh`: deb and rpm built, installed and smoke-tested in containers |
-| P8-A Tier V | #27 | delivered | the env-gated substrate and four bounded scenarios (`volvisor-campaign`'s `tier_v`), and the first recorded host run committed at [docs/evidence/tier-v/2026-10-10-devhost/REPORT.md](../evidence/tier-v/2026-10-10-devhost/REPORT.md) |
+| P8-A Tier V | #27, #32 | delivered | the env-gated substrate and four bounded scenarios (`volvisor-campaign`'s `tier_v`), the first recorded host run committed at [docs/evidence/tier-v/2026-10-10-devhost/REPORT.md](../evidence/tier-v/2026-10-10-devhost/REPORT.md), and the recorded follow-up resolved in #32 — the resize notified leg proven against the pinned upstream v51.1 binary ([docs/evidence/tier-v/2026-10-11-devhost-v51/REPORT.md](../evidence/tier-v/2026-10-11-devhost-v51/REPORT.md)) |
 | P8-B engine-comparison gate | #28 | decided — gate closed | [the methodology](../benchmarks/engine-comparison-methodology.md) §7: no benchmark can honestly run in this phase, so no new engine is built; the gate reopens only by executing the methodology on matched hardware |
 | P8-C local-mirror experiment | #28 | decided — declined | [ADR-0011](../adr/0011-local-mirror-experiment-decline.md), with the reopenable sketch in its appendix |
 | P9-A lending surface | #29 | delivered | the contract's six lending invariants, one daemon-level Tier S test each (`volvisor-api`'s `lending_tests`), the contract's operator shape and the implementation agreeing |
@@ -531,7 +547,7 @@ surface of the rook-cell contract, daemon-tested to its six invariants
 (#29); and, after the closing record was first drafted, the shared
 operation-id namespace hardening (F5 of PR #23's review) landed as PR
 #31 — derived peer ids in a reserved, consumer-unreachable namespace.
-The workspace suite stands at 1046 tests, and the campaign
+The workspace suite stands at 1047 tests, and the campaign
 certification (CG1–CG5) passed at every stage's head — the honesty
 rules of §0 held throughout: no artifact of P6–P9 claims production
 support, real-media durability, or anything else its evidence does not
@@ -542,10 +558,12 @@ hosts (KVM/IOMMU, one sacrificial NVMe controller each, an external
 Kubernetes control plane) — the POC README's not-run markers are the
 gate list, ADR-0008's decision list is unchanged, and the lending
 surface's real observation leg and the volvisord runtime wiring arrive
-with that work, not before it. The P8-A recorded follow-up: the resize
-scenario's notified leg needs a host whose Cloud Hypervisor carries the
-`vm.resize-disk` route (upstream by v51.0.0; the recorded run's v43.0.0
-predates it, and the refusal branch was recorded). The grant_set
+with that work, not before it. The P8-A recorded follow-up (the resize
+scenario's notified leg against a route-carrying binary) was open when
+this section was first drafted and is now **resolved in PR #32**: the
+`notified` leg is recorded from a real observation against the pinned
+upstream v51.1 binary, with the version-gate boundary recorded both
+ways (`docs/evidence/tier-v/2026-10-11-devhost-v51/`). The grant_set
 wedge's convergence horizon: a park that outlives the 60 s lease TTL
 spins honestly with no re-mint path — the remedy directions are
 recorded in the diagnosis doc, not shipped. One backlog pin the phase

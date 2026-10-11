@@ -1,0 +1,67 @@
+{
+  "commit": "1762a9d3ffe1af96cfc7fa4c4c5d3f74d2785499",
+  "components": {
+    "drbd-tooling": "fake",
+    "vmm": {
+      "ch_remote": {
+        "path": "/var/lib/chv/qual/installsh-root/usr/local/bin/ch-remote",
+        "sha256": "a1a978e16bdb4ec762e92cab00f4983f9ce722d7b191ac3a40f102feafcd9713",
+        "version": "ch-remote v51.1"
+      },
+      "cloud_hypervisor": {
+        "path": "/var/lib/volvisor-test-assets/cloud-hypervisor-v51.1",
+        "sha256": "a153dafae80bae92545c4a9165782454b6c03958dae5b128ca9b6e9f5102397d",
+        "version": "cloud-hypervisor v51.1"
+      },
+      "guest": "direct kernel boot (host kernel + initramfs to a busybox shell on ttyS0); the guest issues no disk I/O — the write workload is the rig's model through the simulated device",
+      "legacy_cloud_hypervisor": {
+        "path": "/usr/bin/cloud-hypervisor",
+        "role": "the resize scenario's version-gate boundary leg: its --version probed through the real runner, never a launched VMM",
+        "sha256": "a250a9347d0ea9e93f88b54b25df3cdc6a9ba3c57f292aaf74bb664fb5c87496",
+        "version": "cloud-hypervisor v43.0.0"
+      },
+      "storage_below_the_seam": "simulated (the campaign's fake DRBD worlds; file-backed disks at the DRBD device paths)"
+    },
+    "volvisord": "in-process daemons over the real router (the campaign rig)",
+    "witness": "in-process"
+  },
+  "duration_ms": 1450,
+  "fault": {
+    "at": "journal peer_restore_vm before outcome",
+    "kind": "crash-before-journal-write"
+  },
+  "invariants": [
+    {
+      "g5_no_resume_over_barrier": "pass: barrier non-voided and all-true; source never resumed"
+    },
+    {
+      "d6a_no_double_grant": "pass: authority epoch 2, holder node-b"
+    },
+    {
+      "kill_leg_real_state_recorded": "pass: the interrupted restore left the destination VM Running (observed over the api socket at the kill leg); the source VM was already destroyed — the cut's ordering held over the real VMM"
+    }
+  ],
+  "kernel": "6.8.0-142-generic",
+  "logs": {
+    "destination_journal": "/root/git/volvisor/target/campaign-evidence/run-520854/logs/tier-v/kill-window-mid-restore/b/journal.log",
+    "journal": "/root/git/volvisor/target/campaign-evidence/run-520854/logs/tier-v/kill-window-mid-restore/a/journal.log",
+    "migration_records": "/root/git/volvisor/target/campaign-evidence/run-520854/logs/tier-v/kill-window-mid-restore/a/migrations",
+    "peer_preparations": "/root/git/volvisor/target/campaign-evidence/run-520854/logs/tier-v/kill-window-mid-restore/b/peer-preparations",
+    "witness": "/root/git/volvisor/target/campaign-evidence/run-520854/logs/tier-v/kill-window-mid-restore/witness"
+  },
+  "oracle": {
+    "acknowledged": 0,
+    "barrier_durable_at": 1000,
+    "boundary_seq": null,
+    "boundary_skew_ticks": null,
+    "boundary_source": "data-path",
+    "corrupted": 0,
+    "stop_reason": "nothing-acked",
+    "tail": 0,
+    "verified": 0,
+    "verified_side": "destination"
+  },
+  "outcome": "recovered: the destination kill inside the real restore re-drove to COMPLETE through the startup pass — the re-drive's acts landed on the real VMMs and the kill leg's mid-flight state was observed over the api sockets, never assumed",
+  "scenario": "tier-v/kill-window-mid-restore",
+  "tier": "V"
+}
