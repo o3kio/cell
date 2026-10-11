@@ -155,7 +155,23 @@ unrunnable/unparseable binary) the gate refuses — fail-closed. A
 refusal never fails the grow: the volume's backing is already
 resized, and the response honestly says `retry_required` with the
 recorded reason until the configuration is fixed. The repository
-pins no default release. Consumer attachments carry the VMM-side
+pins no default release. What has been live-verified (the two
+recorded Tier V runs, both committed under
+`docs/evidence/tier-v/`): cloud-hypervisor **v43.0.0 lacks the
+`vm.resize-disk` route** (the notification's PUT answers HTTP 404
+— the grow reports `retry_required` carrying it), and **v51.1
+carries it** (the PUT answered 2xx and the notification converged
+`notified`, with the request body `{"id", "desired_size"}` —
+`desired_size` in bytes — per v51.1's published OpenAPI).
+Between those live-verified points, upstream's own pinned OpenAPI
+places the route's introduction between v49.0 (absent) and v50.0
+(present) — a document-verified bound, not a live observation. A
+`minimum_version` at or above the route's introduction is what
+makes the gate meaningful (the recorded runs use `51.0.0` as the
+boundary pin, and record it both ways: proven on a route-carrying
+binary, fail-closed below it); a minimum the binary does not meet
+refuses the notification before any VMM call. Consumer
+attachments carry the VMM-side
 disk id (`vmm_disk_id` on the attach request) the notification
 addresses; an attached volume without one cannot be notified and
 reports the same recorded refusal. Outstanding notifications are

@@ -88,7 +88,15 @@
 //!   contract held exactly as designed: the typed refusal is
 //!   carried, the grow reports `retry_required`, never a silent
 //!   un-notified success. The route follow-up is recorded in the
-//!   `resize-notification` scenario's evidence.
+//!   `resize-notification` scenario's evidence — RESOLVED by the
+//!   second recorded run (PR #32, the upstream v51.1 binary pinned
+//!   by its release asset + SHA256): the real route answered 2xx
+//!   and the `notified` leg is recorded from a real observation.
+//!   The same re-run surfaced the route's request-body drift (the
+//!   pre-route field name; v51.1's pinned OpenAPI says `id` +
+//!   `desired_size`) as a live typed 400 — fixed with the run, the
+//!   finding recorded in the second bundle under
+//!   `docs/evidence/tier-v/`.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};

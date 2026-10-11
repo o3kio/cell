@@ -68,11 +68,12 @@ reading — the shape test pins this table to the records):
    contract both ways: a 2xx means `notified`; a typed refusal means
    a durable `retry_required` record carrying the refusal, the grow
    still completes, and the retry pass converges. The record names
-   the branch it observed. Re-running the scenario on a host whose
-   Cloud Hypervisor carries the route (upstream by v51.0.0), so the
-   `notified` leg is recorded from a real observation too, is a
-   recorded P8-A follow-up in the
-   [implementation plan](../../../plans/2026-10-10-post-p5-implementation-plan.md).
+   the branch it observed. **RESOLVED in PR #32**: the scenario was
+   re-run against the upstream v51.1 release binary and the
+   `notified` leg is recorded from a real observation — the
+   [second recorded run](../2026-10-11-devhost-v51/) carries it,
+   together with the version-gate boundary (51.0.0) recorded both
+   ways and the request-body drift the live route surfaced.
 2. **A live empty VMM's `info` answers HTTP 500 with the body "VM is
    not created"** — a not-found shape no doc-derived token matched,
    so the empty-restore-target steady state surfaced as a typed
