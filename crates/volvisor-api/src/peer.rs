@@ -311,6 +311,13 @@ impl PeerRouteContext {
         &self.snapshot_root
     }
 
+    /// The durable target-preparation store (the rig's crash-seam
+    /// arming and the tests' inspection surface).
+    #[must_use]
+    pub fn preparations(&self) -> &TargetPreparationStore {
+        &self.preparations
+    }
+
     /// Renew the grant-hold leases of this destination's live
     /// preparations — the convergence-horizon remedy's common case
     /// (the daemon's lease-renewal task calls this alongside
@@ -1840,7 +1847,14 @@ async fn grant_inspect(
     }))
 }
 
-/// The grant act.
+/// The grant act. The whole act is one linear narrative — the
+/// witness views, the branch shape (the serviceable grant, the
+/// horizon's gated re-mint, today's path), the batch, the promotes,
+/// the durable device paths — and its ordering IS its safety
+/// argument (the gates run before any bump, the bump before the
+/// witness call, the paths before the outcome); splitting it into
+/// helpers would hide the order the review certifies.
+#[allow(clippy::too_many_lines)] // the act's linear narrative (above)
 async fn grant_act(
     ctx: Arc<PeerRouteContext>,
     req: PeerGrantRequest,

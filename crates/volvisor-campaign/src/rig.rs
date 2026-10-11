@@ -34,7 +34,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-use volvisor_api::peer::PeerRouteContext;
+use volvisor_api::peer::{PeerRouteContext, TargetPreparationStore};
 use volvisor_api::{AppState, CrashHooks, KillSwitch, router};
 use volvisor_drbd::AuthorityContext;
 use volvisor_drbd::provider::{DrbdProvider, DrbdProviderConfig, resource_name_for};
@@ -690,6 +690,11 @@ pub struct Daemon {
     /// every launch — see the core's `make_provider` method; the
     /// store-save seams a scenario arms hang off it).
     pub provider: Arc<DrbdProvider>,
+    /// This launch's peer-preparation store handle (the
+    /// destination-side preparation records; the horizon remedy's
+    /// store-save seam — the attempt-counter bump and the
+    /// device-path recordings — arms hang off it).
+    pub peer_preparations: TargetPreparationStore,
 }
 
 impl Daemon {
@@ -770,6 +775,19 @@ impl Daemon {
         // share.
         let renewal = spawn_renewal_loop(Arc::clone(&provider), Arc::clone(&peer_ctx));
 
+        // The preparation store's store-save seam is fresh per
+        // `wire_migration` call too (the store re-opens the same
+        // durable directory): register the same kill switch so a
+        // preparation-save kill (the attempt-counter bump, a
+        // device-path recording) fires into the same group — the
+        // horizon remedy's durable boundaries are kill-testable
+        // exactly like every other store's.
+        peer_ctx
+            .preparations()
+            .store_crash_hooks()
+            .set_kill_switch(core.kill_switch());
+        let peer_preparations = peer_ctx.preparations().clone();
+
         let state = AppState::new(
             Arc::clone(&provider) as Arc<dyn VolumeProvider>,
             None,
@@ -806,6 +824,7 @@ impl Daemon {
             addr,
             handle,
             provider,
+            peer_preparations,
         }
     }
 

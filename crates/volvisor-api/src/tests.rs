@@ -3135,12 +3135,17 @@ struct FakeWitnessVolume {
     lease_id: u64,
     lease_state: volvisor_types::LeaseState,
     holder: Option<volvisor_types::HostId>,
+    /// The scripted `lease_remaining_secs` the inspect view reports
+    /// (the grant-hold renewal's due rule reads it).
+    remaining_secs: u64,
 }
 
 /// A scripted witness for the peer routes: `inspect` answers the
 /// scripted views, `grant_set` mints epochs for this host and records
 /// every call (idempotent per operation id, like the real journal);
-/// everything else refuses typed (unused by these routes).
+/// `renew` records every call and answers the scripted remaining
+/// duration (the grant-hold renewal pass); everything else refuses
+/// typed (unused by these routes).
 struct FakePeerWitness {
     host: volvisor_types::HostId,
     volumes: std::sync::Mutex<BTreeMap<volvisor_types::VolumeId, FakeWitnessVolume>>,
@@ -3149,6 +3154,19 @@ struct FakePeerWitness {
     grant_set_calls: std::sync::Mutex<Vec<GrantSetRequest>>,
     recorded_grants: std::sync::Mutex<BTreeMap<volvisor_types::OperationId, GrantSetResponse>>,
     grant_set_refusals: std::sync::Mutex<std::collections::VecDeque<WitnessError>>,
+    renew_calls: std::sync::Mutex<
+        Vec<(
+            volvisor_types::VolumeId,
+            volvisor_witness::proto::RenewRequest,
+        )>,
+    >,
+    renew_refusals: std::sync::Mutex<std::collections::VecDeque<WitnessError>>,
+    renew_remaining_secs: std::sync::Mutex<u64>,
+    barriers: std::sync::Mutex<
+        BTreeMap<volvisor_types::VolumeId, Vec<volvisor_types::RecordedMigrationBarrier>>,
+    >,
+    retirements:
+        std::sync::Mutex<BTreeMap<volvisor_types::VolumeId, Vec<volvisor_types::EpochRetirement>>>,
 }
 
 /// A plausible registration for a scripted volume: one lineage UUID
@@ -3181,6 +3199,11 @@ impl FakePeerWitness {
             grant_set_calls: std::sync::Mutex::new(Vec::new()),
             recorded_grants: std::sync::Mutex::new(BTreeMap::new()),
             grant_set_refusals: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            renew_calls: std::sync::Mutex::new(Vec::new()),
+            renew_refusals: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            renew_remaining_secs: std::sync::Mutex::new(100),
+            barriers: std::sync::Mutex::new(BTreeMap::new()),
+            retirements: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -3210,13 +3233,64 @@ impl FakePeerWitness {
     /// becomes REGISTERED (the prepare act's lineage gate reads the
     /// registration; the fake handoff surface ignores its content).
     fn set_live(&self, volume: &volvisor_types::VolumeId, epoch: u64, lease_id: u64) {
+        self.set_volume(
+            volume,
+            epoch,
+            lease_id,
+            volvisor_types::LeaseState::Live,
+            30,
+        );
+    }
+
+    /// Script a live lease with an explicit remaining duration (the
+    /// grant-hold renewal's due rule reads it: a lease within the
+    /// renewal interval of its end is due).
+    fn set_live_with_remaining(
+        &self,
+        volume: &volvisor_types::VolumeId,
+        epoch: u64,
+        lease_id: u64,
+        remaining_secs: u64,
+    ) {
+        self.set_volume(
+            volume,
+            epoch,
+            lease_id,
+            volvisor_types::LeaseState::Live,
+            remaining_secs,
+        );
+    }
+
+    /// Script the beyond-TTL shape: a lease this host held that
+    /// lapsed at the witness (state `Expired`, holder unchanged) —
+    /// the fresh-grant gates' input.
+    fn set_expired(&self, volume: &volvisor_types::VolumeId, epoch: u64, lease_id: u64) {
+        self.set_volume(
+            volume,
+            epoch,
+            lease_id,
+            volvisor_types::LeaseState::Expired,
+            0,
+        );
+    }
+
+    /// Script the volume state (the shared tail of the setters above).
+    fn set_volume(
+        &self,
+        volume: &volvisor_types::VolumeId,
+        epoch: u64,
+        lease_id: u64,
+        lease_state: volvisor_types::LeaseState,
+        remaining_secs: u64,
+    ) {
         self.volumes.lock().expect("volumes").insert(
             volume.clone(),
             FakeWitnessVolume {
                 epoch,
                 lease_id,
-                lease_state: volvisor_types::LeaseState::Live,
+                lease_state,
                 holder: Some(self.host.clone()),
+                remaining_secs,
             },
         );
         self.registrations
@@ -3224,6 +3298,63 @@ impl FakePeerWitness {
             .expect("registrations")
             .entry(volume.clone())
             .or_insert_with(|| synthetic_registration(volume, &self.host));
+    }
+
+    /// Script one non-voided migration barrier at `epoch` naming
+    /// `migration` (the cut's fence evidence — gate (c)'s barrier
+    /// arm; the attestation is all-true, the recorded shape).
+    fn set_barrier(
+        &self,
+        volume: &volvisor_types::VolumeId,
+        migration: &volvisor_types::MigrationId,
+        epoch: u64,
+    ) {
+        self.barriers
+            .lock()
+            .expect("barriers")
+            .entry(volume.clone())
+            .or_default()
+            .push(volvisor_types::RecordedMigrationBarrier {
+                holder: host_id("src-host"),
+                epoch: volvisor_types::WriterEpoch(epoch),
+                boundary_commit_index: 1,
+                attestation: volvisor_types::BarrierAttestation {
+                    vm_paused_and_drained: true,
+                    data_path_suspended: true,
+                    peer_up_to_date: true,
+                },
+                migration_id: Some(migration.clone()),
+                recorded_at: 1,
+                voided: false,
+            });
+    }
+
+    /// Script one durably retired epoch (gate (c)'s retirement arm —
+    /// the shape a `revoke_set` leaves).
+    fn set_retired(&self, volume: &volvisor_types::VolumeId, epoch: u64) {
+        self.retirements
+            .lock()
+            .expect("retirements")
+            .entry(volume.clone())
+            .or_default()
+            .push(volvisor_types::EpochRetirement {
+                epoch: volvisor_types::WriterEpoch(epoch),
+                commit_index: 1,
+            });
+    }
+
+    /// Queue one refusal the next `renew` call serves and spends
+    /// (the renewal pass's witness-unreachable deferral).
+    fn refuse_next_renew(&self, error: WitnessError) {
+        self.renew_refusals
+            .lock()
+            .expect("renew refusals")
+            .push_back(error);
+    }
+
+    /// Script the remaining duration a scripted `renew` answers with.
+    fn set_renew_remaining(&self, remaining_secs: u64) {
+        *self.renew_remaining_secs.lock().expect("renew remaining") = remaining_secs;
     }
 }
 
@@ -3237,7 +3368,7 @@ impl FakePeerWitness {
             holder: entry.and_then(|v| v.holder.clone()),
             lease_state: entry.map_or(volvisor_types::LeaseState::None, |v| v.lease_state),
             lease_id: entry.map(|v| volvisor_types::LeaseId(v.lease_id)),
-            lease_remaining_secs: entry.map(|_| 30),
+            lease_remaining_secs: entry.map(|v| v.remaining_secs),
             commit_index: 1,
             registration: self
                 .registrations
@@ -3245,8 +3376,20 @@ impl FakePeerWitness {
                 .expect("registrations")
                 .get(volume)
                 .cloned(),
-            barriers: Vec::new(),
-            retirements: Vec::new(),
+            barriers: self
+                .barriers
+                .lock()
+                .expect("barriers")
+                .get(volume)
+                .cloned()
+                .unwrap_or_default(),
+            retirements: self
+                .retirements
+                .lock()
+                .expect("retirements")
+                .get(volume)
+                .cloned()
+                .unwrap_or_default(),
         }
     }
 }
@@ -3270,10 +3413,35 @@ impl BlockingWitnessConnection for FakePeerWitness {
 
     fn renew(
         &self,
-        _volume_id: &volvisor_types::VolumeId,
-        _request: RenewRequest,
+        volume_id: &volvisor_types::VolumeId,
+        request: RenewRequest,
     ) -> Result<RenewResponse, WitnessError> {
-        Err(WitnessError::InvalidRequest("not scripted".to_owned()))
+        // The scripted-refusal knob (the witness-unreachable
+        // deferral): a queued WitnessError is served and spent before
+        // the scripted-success path.
+        if let Some(error) = self
+            .renew_refusals
+            .lock()
+            .expect("renew refusals")
+            .pop_front()
+        {
+            return Err(error);
+        }
+        let epoch = volvisor_types::WriterEpoch(
+            self.volumes
+                .lock()
+                .expect("volumes")
+                .get(volume_id)
+                .map_or(0, |volume| volume.epoch),
+        );
+        self.renew_calls
+            .lock()
+            .expect("renew calls")
+            .push((volume_id.clone(), request));
+        Ok(RenewResponse {
+            epoch,
+            remaining_secs: *self.renew_remaining_secs.lock().expect("renew remaining"),
+        })
     }
 
     fn revoke(
@@ -3343,6 +3511,7 @@ impl BlockingWitnessConnection for FakePeerWitness {
                         lease_id: 0,
                         lease_state: volvisor_types::LeaseState::None,
                         holder: None,
+                        remaining_secs: 30,
                     });
                 entry.epoch += 1;
                 entry.lease_id += 1;
@@ -3464,6 +3633,7 @@ struct PeerKit {
     fake_vmm: Arc<volvisor_provider::FakeVmm>,
     provider: Arc<FakeProvider>,
     store: TargetPreparationStore,
+    context: Arc<PeerRouteContext>,
     host: volvisor_types::HostId,
     snapshot_root: PathBuf,
     dir: tempfile::TempDir,
@@ -3491,7 +3661,7 @@ fn setup_peer_with_root(snapshot_root: PathBuf) -> PeerKit {
     ));
     let state = Arc::new(
         AppState::new(provider.clone(), None, journal, Some(TEST_TOKEN.to_owned()))
-            .with_peer_routes(Some(PEER_TOKEN.to_owned()), context),
+            .with_peer_routes(Some(PEER_TOKEN.to_owned()), context.clone()),
     );
     PeerKit {
         state,
@@ -3501,6 +3671,7 @@ fn setup_peer_with_root(snapshot_root: PathBuf) -> PeerKit {
         fake_vmm,
         provider,
         store,
+        context,
         host,
         snapshot_root: PathBuf::new(),
         dir,
@@ -4417,6 +4588,759 @@ async fn peer_grant_surfaces_the_inspection_error_not_the_stale_recorded_failure
     assert!(
         !message.contains("the recorded wedge failure"),
         "the stale recorded failure is never re-served: {message}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The convergence horizon: the gated fresh-grant re-mint and the
+// grant-hold renewal (the diagnosis doc's horizon section)
+// ---------------------------------------------------------------------------
+
+/// Arrange the beyond-TTL park directly (the world a witness outage
+/// past the lease TTL leaves): a pre-promote preparation whose
+/// recorded grant lapsed at the witness — state `Expired`, still held
+/// by this host — with the cut's fence evidence intact below the
+/// granted epoch.
+async fn arrange_lapsed_park(kit: &PeerKit, raw_volume: &str, migration_raw: &str) {
+    create_volume(kit, raw_volume).await;
+    let volume = volume_id(raw_volume);
+    let migration = migration_id(migration_raw);
+    kit.store
+        .install(&TargetPreparation {
+            migration_id: migration.clone(),
+            vm_id: "vm-h".to_owned(),
+            source_host: host_id("src-host"),
+            target_host: kit.host.clone(),
+            participants: vec![PreparedParticipant {
+                volume_id: volume.clone(),
+                expected_generation: 1,
+                device_path: None,
+            }],
+            grant_attempt: 0,
+            created_at: 1,
+        })
+        .expect("install preparation");
+    // The recorded grant: epoch 2 minted for this host over the
+    // source's retired epoch 1 (the barrier names the migration — the
+    // cut's fence evidence).
+    kit.witness.set_expired(&volume, 2, 1);
+    kit.witness.set_barrier(&volume, &migration, 1);
+    kit.witness.set_retired(&volume, 1);
+}
+
+/// The horizon remedy's fresh grant: when the recorded grant's lease
+/// is provably dead (expired at the witness, still ours) and the park
+/// is provably pre-promote with its fence evidence intact, the grant
+/// act re-issues under a NEW derived operation id — the journaled
+/// attempt counter folded into the reserved namespace — and the
+/// re-minted grant drives the promotes to completion.
+#[tokio::test]
+async fn peer_grant_re_mints_under_a_new_derived_id_when_the_grant_lease_lapsed() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    arrange_lapsed_park(&kit, "vol-h1", "mig-h1").await;
+
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-h1"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["grants"][0]["device_path"],
+        json!("/dev/drbd-by-res/vol-h1"),
+        "the re-minted grant drove the promote"
+    );
+
+    // The witness batch ran exactly once, under the attempt-1
+    // reserved-namespace id — never the original bare id (its
+    // journal entry is the expired grant the re-mint exists to
+    // leave behind).
+    let calls = kit.witness.grant_set_calls.lock().expect("calls").clone();
+    assert_eq!(calls.len(), 1);
+    let raw = calls[0].operation_id.as_str();
+    assert!(
+        raw.starts_with("derived:mig-grant-set-r1-"),
+        "the re-mint mints under the attempt-folded derived id: {raw}"
+    );
+    assert!(!raw.starts_with("mig-grant-set-"));
+
+    // The attempt counter is journaled on the preparation (durable
+    // before the witness call — a re-drive re-derives this id).
+    let preparation = kit
+        .store
+        .load(&migration_id("mig-h1"))
+        .expect("load")
+        .expect("installed");
+    assert_eq!(preparation.grant_attempt, 1);
+    assert_eq!(kit.handoff.promotes.lock().expect("promotes").len(), 1);
+}
+
+/// The re-mint's determinism across a crash: the attempt counter was
+/// bumped durably and the fresh witness call landed, but the route's
+/// outcome did not (the in-flight intent shape) — the re-drive
+/// re-derives the SAME attempt-1 id and the witness journal replays
+/// the recorded grant under it, never minting a second one.
+#[tokio::test]
+async fn peer_grant_re_mint_id_is_deterministic_across_the_in_flight_re_drive() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    arrange_lapsed_park(&kit, "vol-h2", "mig-h2").await;
+    let volume = volume_id("vol-h2");
+    let migration = migration_id("mig-h2");
+
+    // The world after the fresh grant landed but before the route's
+    // outcome journaled: the attempt counter is already 1, the fresh
+    // lease is live at epoch 3, and the witness journal holds the
+    // grant under the attempt-1 id.
+    kit.store
+        .begin_grant_attempt(&migration)
+        .expect("bump attempt");
+    kit.witness.set_live(&volume, 3, 2);
+    let attempt_id = volvisor_handoff::grant_set_reissue_operation_id(
+        &migration,
+        &[volvisor_handoff::Participant {
+            volume_id: volume.clone(),
+            expected_generation: 1,
+            resource: String::new(),
+            minor: 0,
+        }],
+        1,
+    )
+    .expect("derive the expected attempt-1 id");
+    kit.witness
+        .recorded_grants
+        .lock()
+        .expect("recorded grants")
+        .insert(
+            attempt_id.clone(),
+            volvisor_witness::proto::GrantSetResponse {
+                grants: vec![volvisor_witness::proto::BatchGrantOutcome {
+                    volume_id: volume.clone(),
+                    epoch: volvisor_types::WriterEpoch(3),
+                    lease_id: volvisor_types::LeaseId(2),
+                    lease_ttl_secs: 30,
+                    fencing_proof: volvisor_types::FencingProof {
+                        volume_id: volume.clone(),
+                        retired_epoch: volvisor_types::WriterEpoch(2),
+                        commit_index: 1,
+                    },
+                }],
+            },
+        );
+    inject_peer_intent(
+        &kit,
+        &migration,
+        "peer-grant",
+        ops::OP_PEER_GRANT,
+        &serde_json::to_value(PeerGrantRequest {
+            migration_id: migration.clone(),
+        })
+        .expect("serialize"),
+    );
+
+    // The re-drive: the inspection cannot prove the act landed (no
+    // device paths), so the act re-executes — and re-derives the
+    // attempt-1 id, so the witness REPLAYS the recorded grant instead
+    // of minting a second one.
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-h2"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["grants"][0]["device_path"],
+        json!("/dev/drbd-by-res/vol-h2")
+    );
+    assert_eq!(
+        kit.witness.grant_set_calls.lock().expect("calls").len(),
+        0,
+        "the re-drive re-derived the attempt-1 id and replayed the \
+         recorded grant — a different id would have minted here"
+    );
+    assert_eq!(kit.handoff.promotes.lock().expect("promotes").len(), 1);
+    // The counter was not bumped again: the lease is live, so the
+    // re-drive took the serviceable path, not a second re-mint.
+    assert_eq!(
+        kit.store
+            .load(&migration)
+            .expect("load")
+            .expect("installed")
+            .grant_attempt,
+        1
+    );
+}
+
+/// Gate (b), the negative: the record is at or after promote (one
+/// participant's device path is durably recorded while another still
+/// needs the lease — the mixed park a mid-promote-loop crash leaves)
+/// — the re-mint is refused typed (a re-mint would retire the epoch a
+/// completed promote's authority is anchored to) and the park keeps
+/// its honest spin: no witness call, no counter bump.
+#[tokio::test]
+async fn peer_grant_refuses_the_re_mint_when_the_record_is_at_or_after_promote() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-h3").await;
+    create_volume(&kit, "vol-h3b").await;
+    let migration = migration_id("mig-h3");
+    for raw in ["vol-h3", "vol-h3b"] {
+        let volume = volume_id(raw);
+        kit.witness.set_expired(&volume, 2, 1);
+        kit.witness.set_barrier(&volume, &migration, 1);
+        kit.witness.set_retired(&volume, 1);
+    }
+    kit.store
+        .install(&TargetPreparation {
+            migration_id: migration.clone(),
+            vm_id: "vm-h3".to_owned(),
+            source_host: host_id("src-host"),
+            target_host: kit.host.clone(),
+            participants: vec![
+                PreparedParticipant {
+                    volume_id: volume_id("vol-h3"),
+                    expected_generation: 1,
+                    device_path: Some("/dev/drbd-by-res/vol-h3".to_owned()),
+                },
+                PreparedParticipant {
+                    volume_id: volume_id("vol-h3b"),
+                    expected_generation: 1,
+                    device_path: None,
+                },
+            ],
+            grant_attempt: 0,
+            created_at: 1,
+        })
+        .expect("install preparation");
+
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-h3"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], json!("INVALID_STATE"));
+    let message = body["message"].as_str().expect("message");
+    assert!(
+        message.contains("at or after promote"),
+        "the refusal names the gate: {message}"
+    );
+    assert!(
+        message.contains("vol-h3"),
+        "the refusal names the promoted participant: {message}"
+    );
+    assert!(
+        message.contains("pre-promote"),
+        "the refusal states the remedy's scope: {message}"
+    );
+    assert_eq!(
+        kit.witness.grant_set_calls.lock().expect("calls").len(),
+        0,
+        "no witness call — the park keeps its honest spin"
+    );
+    assert_eq!(kit.handoff.promotes.lock().expect("promotes").len(), 0);
+    assert_eq!(
+        kit.store
+            .load(&migration)
+            .expect("load")
+            .expect("installed")
+            .grant_attempt,
+        0,
+        "the attempt counter is never bumped on a refusal"
+    );
+}
+
+/// Gate (c), the negative: the witness's fence evidence for the
+/// participant is not the shape the grant left (no barrier naming the
+/// migration, no retired source epoch below the granted one) — the
+/// re-mint is refused typed: a fresh grant must never mint while any
+/// writer could be live.
+#[tokio::test]
+async fn peer_grant_refuses_the_re_mint_when_the_fence_evidence_moved() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-h4").await;
+    let volume = volume_id("vol-h4");
+    let migration = migration_id("mig-h4");
+    kit.store
+        .install(&TargetPreparation {
+            migration_id: migration.clone(),
+            vm_id: "vm-h4".to_owned(),
+            source_host: host_id("src-host"),
+            target_host: kit.host.clone(),
+            participants: vec![PreparedParticipant {
+                volume_id: volume.clone(),
+                expected_generation: 1,
+                device_path: None,
+            }],
+            grant_attempt: 0,
+            created_at: 1,
+        })
+        .expect("install preparation");
+    // The lapsed lease, but the fence evidence is GONE: no barrier
+    // naming the migration, no retirement below the granted epoch.
+    kit.witness.set_expired(&volume, 2, 1);
+
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-h4"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], json!("INVALID_STATE"));
+    let message = body["message"].as_str().expect("message");
+    assert!(
+        message.contains("fence"),
+        "the refusal names the gate: {message}"
+    );
+    assert!(
+        message.contains("never mint while any writer could be live"),
+        "the refusal states the safety argument: {message}"
+    );
+    assert_eq!(
+        kit.witness.grant_set_calls.lock().expect("calls").len(),
+        0,
+        "no witness call — the park keeps its honest spin"
+    );
+    assert_eq!(
+        kit.store
+            .load(&migration)
+            .expect("load")
+            .expect("installed")
+            .grant_attempt,
+        0
+    );
+}
+
+/// The still-live negative: while any participant's lease is still
+/// live, the re-mint never fires (renewal's job instead) — the act
+/// takes today's path under the CURRENT attempt's id, here the
+/// original bare attempt-0 id (the witness's own live-lease refusal
+/// governs the batch in production).
+#[tokio::test]
+async fn peer_grant_uses_the_original_id_while_a_member_is_still_live() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-m1").await;
+    create_volume(&kit, "vol-m2").await;
+    let migration = migration_id("mig-mixed");
+    kit.store
+        .install(&TargetPreparation {
+            migration_id: migration.clone(),
+            vm_id: "vm-m".to_owned(),
+            source_host: host_id("src-host"),
+            target_host: kit.host.clone(),
+            participants: vec![
+                PreparedParticipant {
+                    volume_id: volume_id("vol-m1"),
+                    expected_generation: 1,
+                    device_path: None,
+                },
+                PreparedParticipant {
+                    volume_id: volume_id("vol-m2"),
+                    expected_generation: 1,
+                    device_path: None,
+                },
+            ],
+            grant_attempt: 0,
+            created_at: 1,
+        })
+        .expect("install preparation");
+    // The mixed shape: one member's lease still live (renewal's job),
+    // the other lapsed.
+    kit.witness.set_live(&volume_id("vol-m1"), 2, 1);
+    kit.witness.set_expired(&volume_id("vol-m2"), 2, 1);
+
+    let (status, _body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-mixed"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let calls = kit.witness.grant_set_calls.lock().expect("calls").clone();
+    assert_eq!(calls.len(), 1);
+    let raw = calls[0].operation_id.as_str();
+    assert!(
+        raw.starts_with("mig-grant-set-") && !raw.starts_with("derived:"),
+        "the mixed shape takes the original-id path, never a re-mint: {raw}"
+    );
+    assert_eq!(
+        kit.store
+            .load(&migration)
+            .expect("load")
+            .expect("installed")
+            .grant_attempt,
+        0,
+        "no attempt was spent while a member is still live"
+    );
+}
+
+/// The grant-hold renewal pass: a pre-promote preparation whose
+/// leases are uniformly live gets its due members renewed (the
+/// `remaining ≤ interval` rule — a lease with headroom is left
+/// alone), under this host's credential with the view's epoch and
+/// lease identity.
+#[tokio::test]
+async fn renew_grant_hold_leases_renews_due_pre_promote_leases() {
+    let kit = setup_peer();
+    create_volume(&kit, "vol-r1").await;
+    create_volume(&kit, "vol-r2").await;
+    let migration = migration_id("mig-renew1");
+    kit.store
+        .install(&TargetPreparation {
+            migration_id: migration.clone(),
+            vm_id: "vm-r1".to_owned(),
+            source_host: host_id("src-host"),
+            target_host: kit.host.clone(),
+            participants: vec![
+                PreparedParticipant {
+                    volume_id: volume_id("vol-r1"),
+                    expected_generation: 1,
+                    device_path: None,
+                },
+                PreparedParticipant {
+                    volume_id: volume_id("vol-r2"),
+                    expected_generation: 1,
+                    device_path: None,
+                },
+            ],
+            grant_attempt: 0,
+            created_at: 1,
+        })
+        .expect("install preparation");
+    // vol-r1 is due (within the interval of its end); vol-r2 has
+    // headroom (not due this pass).
+    kit.witness
+        .set_live_with_remaining(&volume_id("vol-r1"), 2, 1, 10);
+    kit.witness
+        .set_live_with_remaining(&volume_id("vol-r2"), 2, 2, 90);
+
+    let report = kit
+        .context
+        .renew_grant_hold_leases(20)
+        .await
+        .expect("renewal pass");
+    assert_eq!(report.renewed, vec![volume_id("vol-r1")]);
+    assert!(
+        report.lapsed.is_empty(),
+        "the preparation is uniformly live"
+    );
+    assert!(
+        report.deferred.is_empty(),
+        "nothing deferred on the happy pass"
+    );
+
+    let calls = kit.witness.renew_calls.lock().expect("renew calls").clone();
+    assert_eq!(calls.len(), 1, "only the due member was renewed");
+    assert_eq!(calls[0].0, volume_id("vol-r1"));
+    assert_eq!(calls[0].1.epoch, volvisor_types::WriterEpoch(2));
+    assert_eq!(calls[0].1.lease_id, volvisor_types::LeaseId(1));
+    assert_eq!(calls[0].1.host_id, kit.host);
+    assert!(
+        calls[0]
+            .1
+            .operation_id
+            .as_str()
+            .starts_with("grant-hold-renew-vol-r1-"),
+        "the renewal ids carry their volume and are process-unique"
+    );
+}
+
+/// The uniform-liveness coupling: a preparation with one dead member
+/// is skipped whole — the surviving member is deliberately allowed to
+/// lapse toward the fresh-grant gate (renewing it would block that
+/// gate forever), reported in `lapsed`.
+#[tokio::test]
+async fn renew_grant_hold_leases_skips_a_preparation_that_is_not_uniformly_live() {
+    let kit = setup_peer();
+    create_volume(&kit, "vol-s1").await;
+    create_volume(&kit, "vol-s2").await;
+    let migration = migration_id("mig-renew2");
+    kit.store
+        .install(&TargetPreparation {
+            migration_id: migration.clone(),
+            vm_id: "vm-r2".to_owned(),
+            source_host: host_id("src-host"),
+            target_host: kit.host.clone(),
+            participants: vec![
+                PreparedParticipant {
+                    volume_id: volume_id("vol-s1"),
+                    expected_generation: 1,
+                    device_path: None,
+                },
+                PreparedParticipant {
+                    volume_id: volume_id("vol-s2"),
+                    expected_generation: 1,
+                    device_path: None,
+                },
+            ],
+            grant_attempt: 0,
+            created_at: 1,
+        })
+        .expect("install preparation");
+    // One member lapsed: the preparation is not uniformly live.
+    kit.witness
+        .set_live_with_remaining(&volume_id("vol-s1"), 2, 1, 10);
+    kit.witness.set_expired(&volume_id("vol-s2"), 2, 2);
+
+    let report = kit
+        .context
+        .renew_grant_hold_leases(20)
+        .await
+        .expect("renewal pass");
+    assert!(
+        report.renewed.is_empty(),
+        "the lapsed preparation is skipped whole"
+    );
+    assert_eq!(report.lapsed, vec![migration]);
+    assert!(
+        report.deferred.is_empty(),
+        "the lapsed shape defers nothing"
+    );
+    assert_eq!(
+        kit.witness.renew_calls.lock().expect("renew calls").len(),
+        0,
+        "the surviving member is NOT renewed — it must lapse toward \
+         the fresh-grant gate"
+    );
+}
+
+/// The terminal-shape stop: a preparation whose participants are all
+/// promoted (device paths recorded) is not the grant-hold pass's
+/// business — its leases belong to the volumes' own authority blocks
+/// now. No lease outlives its migration record through this pass.
+#[tokio::test]
+async fn renew_grant_hold_leases_stops_at_promoted_participants() {
+    let kit = setup_peer();
+    create_volume(&kit, "vol-p1").await;
+    let migration = migration_id("mig-renew3");
+    kit.store
+        .install(&TargetPreparation {
+            migration_id: migration,
+            vm_id: "vm-r3".to_owned(),
+            source_host: host_id("src-host"),
+            target_host: kit.host.clone(),
+            participants: vec![PreparedParticipant {
+                volume_id: volume_id("vol-p1"),
+                expected_generation: 1,
+                device_path: Some("/dev/drbd-by-res/vol-p1".to_owned()),
+            }],
+            grant_attempt: 0,
+            created_at: 1,
+        })
+        .expect("install preparation");
+    kit.witness
+        .set_live_with_remaining(&volume_id("vol-p1"), 2, 1, 10);
+
+    let report = kit
+        .context
+        .renew_grant_hold_leases(20)
+        .await
+        .expect("renewal pass");
+    assert!(
+        report.renewed.is_empty(),
+        "the terminal shape renews nothing"
+    );
+    assert!(
+        report.lapsed.is_empty(),
+        "the terminal shape is not reported lapsed"
+    );
+    assert!(
+        report.deferred.is_empty(),
+        "the terminal shape defers nothing"
+    );
+    assert_eq!(
+        kit.witness.renew_calls.lock().expect("renew calls").len(),
+        0,
+        "a promoted participant's lease is never renewed by the \
+         grant-hold pass"
+    );
+}
+
+/// The honest deferral: a witness unreachable at renewal time (or a
+/// renewal that cannot cover the interval) fails into `deferred` with
+/// its reason — the pass never crashes, the park's semantics are
+/// unchanged, the next pass retries.
+#[tokio::test]
+async fn renew_grant_hold_leases_defers_honestly_on_witness_failure() {
+    let kit = setup_peer();
+    create_volume(&kit, "vol-d1").await;
+    let migration = migration_id("mig-renew4");
+    kit.store
+        .install(&TargetPreparation {
+            migration_id: migration.clone(),
+            vm_id: "vm-r4".to_owned(),
+            source_host: host_id("src-host"),
+            target_host: kit.host.clone(),
+            participants: vec![PreparedParticipant {
+                volume_id: volume_id("vol-d1"),
+                expected_generation: 1,
+                device_path: None,
+            }],
+            grant_attempt: 0,
+            created_at: 1,
+        })
+        .expect("install preparation");
+    kit.witness
+        .set_live_with_remaining(&volume_id("vol-d1"), 2, 1, 10);
+
+    // The witness is unreachable: the renewal defers with the honest
+    // reason, and the preparation is NOT marked lapsed (the lease's
+    // state is unknown, not dead).
+    kit.witness.refuse_next_renew(WitnessError::Unreachable(
+        "the witness is down (scripted)".to_owned(),
+    ));
+    let report = kit
+        .context
+        .renew_grant_hold_leases(20)
+        .await
+        .expect("renewal pass");
+    assert!(
+        report.renewed.is_empty(),
+        "the witness outage deferred the renewal"
+    );
+    assert!(
+        report.lapsed.is_empty(),
+        "an unreachable witness is not a dead lease"
+    );
+    assert_eq!(report.deferred.len(), 1);
+    assert_eq!(report.deferred[0].0, volume_id("vol-d1"));
+    assert!(
+        report.deferred[0].1.contains("the witness is down"),
+        "the deferral carries the honest reason: {}",
+        report.deferred[0].1
+    );
+
+    // The interval guard (the authority's shrink discipline): a
+    // renewal response that cannot cover the interval is refused and
+    // deferred, never recorded as a renewal.
+    kit.witness.set_renew_remaining(5);
+    let report = kit
+        .context
+        .renew_grant_hold_leases(20)
+        .await
+        .expect("renewal pass");
+    assert!(
+        report.renewed.is_empty(),
+        "the shrink-guarded renewal was refused"
+    );
+    assert!(
+        report.lapsed.is_empty(),
+        "the shrink guard defers, never lapses"
+    );
+    assert_eq!(report.deferred.len(), 1);
+    assert!(
+        report.deferred[0].1.contains("cannot cover"),
+        "the shrink guard's deferral names the discipline: {}",
+        report.deferred[0].1
+    );
+}
+
+/// The attempt counter's durability: `begin_grant_attempt` bumps and
+/// persists atomically (a re-opened store re-reads it), refuses
+/// typed on an absent preparation, and preparations recorded before
+/// the remedy (no `grant_attempt` field on disk) load at attempt 0.
+#[test]
+fn target_preparation_store_journals_the_grant_attempt_durably() {
+    let dir = tempfile::tempdir().expect("journal dir");
+    let store = TargetPreparationStore::open(dir.path().join("preparations")).expect("store open");
+    let migration = migration_id("mig-attempt");
+    store
+        .install(&TargetPreparation {
+            migration_id: migration.clone(),
+            vm_id: "vm-a".to_owned(),
+            source_host: host_id("src-host"),
+            target_host: host_id("dst-host"),
+            participants: vec![PreparedParticipant {
+                volume_id: volume_id("vol-a1"),
+                expected_generation: 1,
+                device_path: None,
+            }],
+            grant_attempt: 0,
+            created_at: 1,
+        })
+        .expect("install");
+
+    // The bump is durable: a re-opened store (the crash-recovery
+    // view) re-reads the counter.
+    assert_eq!(store.begin_grant_attempt(&migration).expect("bump"), 1);
+    assert_eq!(store.begin_grant_attempt(&migration).expect("bump"), 2);
+    let reopened = TargetPreparationStore::open(dir.path().join("preparations")).expect("reopen");
+    assert_eq!(
+        reopened
+            .load(&migration)
+            .expect("load")
+            .expect("installed")
+            .grant_attempt,
+        2,
+        "the attempt counter survives a re-open (the crash-recovery view)"
+    );
+
+    // An absent preparation is the typed NOT_FOUND, never a bump.
+    let error = store
+        .begin_grant_attempt(&migration_id("mig-absent"))
+        .expect_err("absent");
+    assert_eq!(error.code, ApiErrorCode::NotFound);
+
+    // A pre-remedy record file (no grant_attempt field) loads at
+    // attempt 0 — in-flight journals keep replaying the original id.
+    let old_raw = serde_json::json!({
+        "migration_id": "mig-old",
+        "vm_id": "vm-o",
+        "source_host": "src-host",
+        "target_host": "dst-host",
+        "participants": [{
+            "volume_id": "vol-o1",
+            "expected_generation": 1,
+            "device_path": null,
+        }],
+        "created_at": 1,
+    });
+    std::fs::write(
+        dir.path().join("preparations/mig-old.json"),
+        serde_json::to_vec_pretty(&old_raw).expect("serialize"),
+    )
+    .expect("write the pre-remedy record");
+    let with_old = TargetPreparationStore::open(dir.path().join("preparations")).expect("open");
+    assert_eq!(
+        with_old
+            .load(&migration_id("mig-old"))
+            .expect("load")
+            .expect("installed")
+            .grant_attempt,
+        0,
+        "a pre-remedy record keeps attempt 0 — the original id"
+    );
+
+    // load_all: every preparation, ordered by migration id.
+    let all = with_old.load_all().expect("load all");
+    assert_eq!(
+        all.iter()
+            .map(|record| record.migration_id.as_str().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["mig-attempt".to_owned(), "mig-old".to_owned()],
+        "load_all is ordered by migration id"
     );
 }
 
