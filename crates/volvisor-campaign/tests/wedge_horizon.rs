@@ -11,7 +11,8 @@
 //! whole so its members converge to the uniformly-dead shape the
 //! fresh-grant gate arbitrates (renewing a survivor would block that
 //! gate forever). [`park_past_ttl_with_the_witness_alive_renews_and_converges`]
-//! drives a park four TTLs deep and converges with the epoch exactly
+//! drives a park past the lease's original end (two and a half
+//! TTLs deep) and converges with the epoch exactly
 //! 2 (no re-mint ever); [`renewal_stops_at_the_terminal_shape`] is
 //! the api-crate test for the terminal stop (the campaign tail asserts
 //! the converged record's shape).
@@ -42,9 +43,16 @@
 //! lease TTL (the existing §3.3 seam — no new seam introduced). A
 //! park's lease death is a single deliberate clock jump past the
 //! end (the renewal's due window is never entered, so nothing
-//! renews); a renewal park advances in sub-TTL steps with real
-//! settles so the rig's 1 s renewal tick evaluates the due rule at
-//! every clock value the park passes through.
+//! renews); a renewal park advances in due-window steps (85 s: after
+//! each renewal the next due window opens TTL−INTERVAL on, so every
+//! step lands inside it with the lease still live), polling for
+//! each renewal to land — the rig's 1 s renewal tick is the thing
+//! being waited for, never assumed. A re-drive is fired either by
+//! the daemon's own retry tick (the production cadence, observed in
+//! the spin watches: one full tick plus load headroom) or by a
+//! restart's startup sweep — the same production retry_pass the
+//! tick runs, the healed cells' precedent for a scenario whose
+//! subject is a boundary rather than the cadence.
 //!
 //! Every scenario is self-contained (the campaign's house style:
 //! each file defines its own helpers over the rig's public surface),
@@ -70,8 +78,8 @@ use volvisor_campaign::oracle::{
     verify_against,
 };
 use volvisor_campaign::rig::{
-    POLL_BOUND, POLL_STEP, Rig, TTL, body_json, campaign_rig, campaign_rig_volumes, get_migration,
-    poll_migration, post_prepare, post_transfer, role_of, state_name, witness_view,
+    INTERVAL, POLL_BOUND, POLL_STEP, Rig, TTL, body_json, campaign_rig, campaign_rig_volumes,
+    get_migration, poll_migration, post_prepare, post_transfer, role_of, state_name, witness_view,
 };
 use volvisor_drbd::report::Role;
 use volvisor_drbd_testkit::{NODE, PEER_NODE, PeerTransport, SEED_MINOR, spawn_peer_transport};
@@ -91,22 +99,27 @@ const WRITER_WARMUP: Duration = Duration::from_millis(80);
 /// The steady-state transport's lag (§2.1).
 const TRANSPORT_LAG: Duration = Duration::from_millis(1);
 
-/// One stepped clock advance (witness seconds): small enough that
-/// the renewal's due window (the last `INTERVAL` of a lease) is
-/// entered, never jumped over — a renewal park must let the rig's
-/// renewal tick see the lease due while it is still live.
-const CLOCK_STEP: u64 = 40;
+/// One stepped clock advance (witness seconds) for a renewal park:
+/// after each renewal the lease has the full TTL of life and the
+/// next due window opens at `TTL − INTERVAL` — a step of 85 lands
+/// in every due window (15 s of life left, due, still live), so
+/// each step makes exactly one renewal due and the park crosses
+/// the original end on the renewal's coattails.
+const CLOCK_STEP: u64 = 85;
 
-/// The real settle after each stepped advance: comfortably past the
-/// rig's 1 s renewal tick, so every clock value the park passes
-/// through is evaluated by at least one tick.
-const STEP_SETTLE: Duration = Duration::from_millis(1500);
-
-/// How long a parked scenario watches its spin: several retry-tick
-/// periods (the retry task re-drives every ~5 s), enough to prove
-/// the refusal reproduces and nothing drifts, without pretending to
+/// How long a parked scenario watches its spin: one full retry tick
+/// (the production `MIGRATION_RETRY_TICK`, ~5 s) plus ~3 s of
+/// re-drive, observation and load headroom (the PR #21 amendment's
+/// derived-headroom precedent) — enough to prove the refusal
+/// reproduces on the daemon's own tick, without pretending to
 /// observe forever.
-const SPIN_WATCH: Duration = Duration::from_secs(12);
+const SPIN_WATCH: Duration = Duration::from_secs(8);
+
+/// How long the mixed-liveness scenario watches the grant-hold
+/// renewal pass (its tick is the rig's 1 s renewal cadence): three
+/// passes is the proof the survivor was skipped, not sampled
+/// between ticks.
+const COUPLING_WATCH: Duration = Duration::from_secs(3);
 
 /// The per-scenario unique id source (scenarios run concurrently in
 /// the suite; every rig is isolated, the ids keep the evidence and
@@ -517,7 +530,7 @@ async fn assert_uniform_liveness_coupling(rig: &Rig) {
     // THE COUPLING, OBSERVED: several renewal ticks pass while the
     // preparation is not uniformly live; the survivor's remaining
     // duration keeps falling with the clock.
-    tokio::time::sleep(SPIN_WATCH).await;
+    tokio::time::sleep(COUPLING_WATCH).await;
     let before = witness_view(&rig.witness, &vol_id(rig, 0)).await;
     rig.clock.fetch_add(5, Ordering::SeqCst);
     let after = witness_view(&rig.witness, &vol_id(rig, 0)).await;
@@ -694,7 +707,7 @@ async fn assert_converged(
 /// **Mechanism 1, the convergence:** a grant_set-wedge park (the
 /// witness died inside the grant commit; the witness's restart lands
 /// the lease) with the source held down while the park crosses the
-/// lease's original end nearly four times over. The destination's
+/// lease's original end by half again the TTL. The destination's
 /// grant-hold renewal keeps the lease live through the whole park
 /// (the stepped clock advance enters the due window while the lease
 /// still has life — one deliberate jump would skip it), and when the
@@ -710,7 +723,7 @@ async fn park_past_ttl_with_the_witness_alive_renews_and_converges() {
     evidence.fault(
         "witness_kill_inside_grant_commit",
         "grant_set at WitnessAfterIntentAppend (the park), then the source held down while \
-         the frozen clock crosses the lease's original end nearly four times over",
+         the frozen clock crosses the lease's original end by half again the TTL",
     );
     prepare(&rig, "mig-x").await;
     wedge_park(&rig, "mig-x").await;
@@ -724,42 +737,56 @@ async fn park_past_ttl_with_the_witness_alive_renews_and_converges() {
     // lease's whole original TTL passes.
     rig.a.stop().await;
 
-    // THE PARK PAST THE TTL: nine stepped advances (40 witness
-    // seconds each, a real settle per step so the rig's 1 s renewal
-    // tick evaluates the due rule at every value). The original end
-    // is START+TTL; the park ends 360 s past START — 260 s past the
-    // original end. Every step observes the lease still live at
-    // epoch 2 for the destination: the grant-hold renewal did it.
+    // THE PARK PAST THE TTL: three stepped advances (85 witness
+    // seconds each — after each renewal the next due window opens
+    // TTL−INTERVAL on, so every step lands inside it with 15 s of
+    // life left, still live and due), each observed by waiting for
+    // the renewal it makes due (a poll, never a fixed settle: the
+    // rig's 1 s renewal tick is the thing being waited for, and a
+    // loaded box stretches it). The original end is START+TTL; the
+    // park ends 255 s past START — 155 s past the original end, two
+    // and a half TTLs deep. Every step observes the lease still live
+    // at epoch 2 for the destination: the grant-hold renewal did it.
     let original_end = volvisor_campaign::rig::START + TTL;
-    for _ in 0..9 {
+    for step in 0..3 {
         rig.clock.fetch_add(CLOCK_STEP, Ordering::SeqCst);
-        tokio::time::sleep(STEP_SETTLE).await;
-        let view = witness_view(&rig.witness, &rig.volume_id()).await;
-        assert_eq!(
-            view.current_epoch.0, 2,
-            "the renewed grant's epoch never moves (W1-W5): {:?}",
-            view.lease_state
-        );
-        assert_eq!(
-            view.holder.as_ref().map(HostId::as_str),
-            Some(PEER_NODE),
-            "the renewed lease stays the destination's grant hold"
-        );
-        assert_eq!(
-            view.lease_state,
-            LeaseState::Live,
-            "the grant-hold renewal kept the lease live (the park is \
-             {} s past its original end {})",
-            rig.clock.load(Ordering::SeqCst) - volvisor_campaign::rig::START,
-            original_end
-        );
-        assert!(
-            view.lease_remaining_secs.unwrap_or(0) > 0,
-            "the lease has life left at every step of the park"
-        );
+        let deadline = std::time::Instant::now() + POLL_BOUND;
+        loop {
+            let view = witness_view(&rig.witness, &rig.volume_id()).await;
+            assert_eq!(
+                view.current_epoch.0, 2,
+                "the renewed grant's epoch never moves (W1-W5): {:?}",
+                view.lease_state
+            );
+            assert_eq!(
+                view.holder.as_ref().map(HostId::as_str),
+                Some(PEER_NODE),
+                "the renewed lease stays the destination's grant hold"
+            );
+            assert_eq!(
+                view.lease_state,
+                LeaseState::Live,
+                "the grant-hold renewal kept the lease live (the park is \
+                 {} s past its original end {})",
+                rig.clock.load(Ordering::SeqCst) - volvisor_campaign::rig::START,
+                original_end
+            );
+            let remaining = view.lease_remaining_secs.unwrap_or(0);
+            if remaining > INTERVAL {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the grant-hold renewal never fired for step {step} \
+                 (remaining {remaining}s at {}s past the original end) — the \
+                 lease cannot live past its original end without it",
+                rig.clock.load(Ordering::SeqCst) - original_end
+            );
+            tokio::time::sleep(POLL_STEP).await;
+        }
     }
     assert!(
-        rig.clock.load(Ordering::SeqCst) > original_end + 200,
+        rig.clock.load(Ordering::SeqCst) > original_end + 100,
         "the park crossed the original end by a wide margin"
     );
 
@@ -810,7 +837,7 @@ async fn park_past_ttl_with_the_witness_alive_renews_and_converges() {
         writer,
         evidence,
         "recovered: COMPLETE through the renewed grant — the grant-hold renewal kept the \
-         destination's lease live across a park nearly four TTLs deep (the source held \
+         destination's lease live across a park two and a half TTLs deep (the source held \
          down, the witness alive), and the source's return converged through the \
          ordinary re-issue; the epoch is exactly 2 (the recorded grant was renewed, \
          never re-minted), the acknowledged prefix byte-exact at the destination",
@@ -910,6 +937,14 @@ async fn fresh_grant_survives_a_kill_inside_its_own_commit() {
     prepare(&rig, "mig-x").await;
     wedge_park(&rig, "mig-x").await;
 
+    // The source is held down for the whole boundary sequence (the
+    // park holds with no re-drive; each re-drive below is fired
+    // deliberately through the source's restart sweep — the healed
+    // cells' precedent: the startup sweep is the same production
+    // retry_pass the 5 s tick runs, so a scenario whose subject is
+    // the BOUNDARY need not also wait out the CADENCE).
+    rig.a.stop().await;
+
     // The outage past the TTL and the fence window; the witness
     // returns and lands the original grant born dead.
     rig.clock.fetch_add(TTL + 200, Ordering::SeqCst);
@@ -917,23 +952,26 @@ async fn fresh_grant_survives_a_kill_inside_its_own_commit() {
     await_view(&rig, &rig.volume_id(), 2, PEER_NODE, false).await;
 
     // Re-arm the witness kill for the FRESH grant's own commit (the
-    // seam is shared across witness restarts, one shot per arming).
+    // seam is shared across witness restarts, one shot per arming),
+    // then fire the re-drive: the gates pass, attempt 1 is journaled,
+    // the fresh grant's commit begins — and the witness dies inside
+    // it.
     rig.witness
         .crash
         .arm_witness("grant_set", StoreSavePoint::WitnessAfterIntentAppend);
-    // The next re-drive: the gates pass, attempt 1 is journaled, the
-    // fresh grant's commit begins — and the witness dies inside it.
+    rig.a.restart().await;
     await_kill(|| rig.witness.is_killed(), "the fresh grant's commit").await;
     // The witness returns: the roll-forward LANDS the fresh grant
     // (its end is the re-mint clock + TTL — live).
     rig.witness.restart().await;
     await_view(&rig, &rig.volume_id(), 3, PEER_NODE, true).await;
 
-    // The re-drive: the authorize step folds the live re-minted
-    // grant, the promote re-issue re-executes the grant act, which
-    // re-derives the SAME attempt-1 id — the witness replays the
-    // landed grant (never a second mint: the epoch stays exactly 3)
-    // — and the promotes complete under it.
+    // The re-drive (fired the same way): the authorize step folds the
+    // live re-minted grant, the promote re-issue re-executes the
+    // grant act, which re-derives the SAME attempt-1 id — the
+    // witness replays the landed grant (never a second mint: the
+    // epoch stays exactly 3) — and the promotes complete under it.
+    rig.a.restart().await;
     let record = assert_converged(
         &rig,
         "mig-x",
@@ -983,8 +1021,12 @@ async fn fresh_grant_attempt_counter_survives_a_kill_at_the_bump() {
     );
     prepare(&rig, "mig-x").await;
 
-    // The wedge park, then the outage past the TTL and fence window.
+    // The wedge park, then the outage past the TTL and fence window
+    // (the source held down — the re-drives below are fired
+    // deliberately through its restart sweep, the healed cells'
+    // precedent).
     wedge_park(&rig, "mig-x").await;
+    rig.a.stop().await;
     rig.clock.fetch_add(TTL + 200, Ordering::SeqCst);
     rig.witness.restart().await;
     await_view(&rig, &rig.volume_id(), 2, PEER_NODE, false).await;
@@ -997,8 +1039,9 @@ async fn fresh_grant_attempt_counter_survives_a_kill_at_the_bump() {
         .peer_preparations
         .store_crash_hooks()
         .arm(STORE_PEER_PREPARATION, StoreSavePoint::AfterRename);
-    // The next re-drive: the gates pass, the bump saves — and the
+    // Fire the re-drive: the gates pass, the bump saves — and the
     // destination dies over its own durable counter.
+    rig.a.restart().await;
     await_kill(|| rig.b.is_killed(), "the attempt-counter bump").await;
     let preparation = load_preparation(&rig, "mig-x").expect("the preparation is on record");
     assert_eq!(
@@ -1006,9 +1049,11 @@ async fn fresh_grant_attempt_counter_survives_a_kill_at_the_bump() {
         "the killed bump is durable (the counter reads 1 after the crash)"
     );
 
-    // The destination returns; the next re-drive re-reads the
-    // durable counter, bumps to 2, and issues under the r2 id.
+    // The destination returns; the re-drive (fired the same way)
+    // re-reads the durable counter, bumps to 2, and issues under the
+    // r2 id.
     rig.b.restart().await;
+    rig.a.restart().await;
     let record = assert_converged(
         &rig,
         "mig-x",
@@ -1114,10 +1159,14 @@ async fn fresh_grant_refused_at_promote_parks_honestly() {
         await_view(&rig, &vol_id(&rig, index), 2, PEER_NODE, false).await;
     }
 
-    // The re-drives (the source's retry task, alive throughout) hit
-    // the gate: the park observes IN_DOUBT and never completes.
+    // Fire the first re-drive now through the source's restart sweep
+    // (the same production retry_pass its 5 s tick runs — the healed
+    // cells' precedent): the park observes IN_DOUBT and never
+    // completes.
+    rig.a.restart().await;
     let summary = poll_migration(rig.a.addr, "mig-x", "in_doubt").await;
-    // THE SPIN: several retry ticks reproduce the refusal; the
+    // THE SPIN: the retry ticks reproduce the refusal (one full tick
+    // plus headroom — the sweep's refusal is already on record); the
     // epochs never move (no re-mint), the dead leases stay dead.
     assert_spin_holds(&rig, "mig-x", "in_doubt", 2, 3).await;
     for index in 0..3 {

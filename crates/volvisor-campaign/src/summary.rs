@@ -57,7 +57,20 @@ use crate::tier_v;
 /// (the binaries and the cells run with bounded parallelism, so
 /// wall time is at most the sum), which keeps the check honest
 /// without a wall-clock harness.
-pub const SUITE_BOUND_MS: u64 = 60_000;
+///
+/// *Amendment (PR #33, the wedge-horizon family):* the bound is
+/// 90s, not 60s. The family's seven scenarios observe production
+/// cadences in real time — that is the thing they exist to prove,
+/// not an accident to optimize away (the PR #21 row-3 precedent):
+/// three spin watches (one full `MIGRATION_RETRY_TICK` plus the
+/// amendment's ~3s load headroom each), one coupling watch (three
+/// grant-hold renewal passes at the rig's 1s tick), one convergence
+/// that arrives on the retry task's own tick, and three
+/// renewal-step observations — ~36s of designed waits, measured
+/// ~35s serialized for the family against ~34s for the rest of the
+/// campaign (the pre-#33 sum), so the amended bound carries the
+/// measured ~71s whole-campaign sum plus load headroom.
+pub const SUITE_BOUND_MS: u64 = 90_000;
 
 // ---------------------------------------------------------------------------
 // The §9 mapping (static, reviewable — CG1's executable form)
