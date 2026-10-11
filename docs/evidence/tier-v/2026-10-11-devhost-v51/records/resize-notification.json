@@ -1,0 +1,53 @@
+{
+  "commit": "1762a9d3ffe1af96cfc7fa4c4c5d3f74d2785499",
+  "components": {
+    "drbd-tooling": "fake",
+    "vmm": {
+      "ch_remote": {
+        "path": "/var/lib/chv/qual/installsh-root/usr/local/bin/ch-remote",
+        "sha256": "a1a978e16bdb4ec762e92cab00f4983f9ce722d7b191ac3a40f102feafcd9713",
+        "version": "ch-remote v51.1"
+      },
+      "cloud_hypervisor": {
+        "path": "/var/lib/volvisor-test-assets/cloud-hypervisor-v51.1",
+        "sha256": "a153dafae80bae92545c4a9165782454b6c03958dae5b128ca9b6e9f5102397d",
+        "version": "cloud-hypervisor v51.1"
+      },
+      "guest": "direct kernel boot (host kernel + initramfs to a busybox shell on ttyS0); the guest issues no disk I/O — the write workload is the rig's model through the simulated device",
+      "legacy_cloud_hypervisor": {
+        "path": "/usr/bin/cloud-hypervisor",
+        "role": "the resize scenario's version-gate boundary leg: its --version probed through the real runner, never a launched VMM",
+        "sha256": "a250a9347d0ea9e93f88b54b25df3cdc6a9ba3c57f292aaf74bb664fb5c87496",
+        "version": "cloud-hypervisor v43.0.0"
+      },
+      "storage_below_the_seam": "simulated (the campaign's fake DRBD worlds; file-backed disks at the DRBD device paths)"
+    },
+    "volvisord": "in-process daemons over the real router (the campaign rig)",
+    "witness": "in-process"
+  },
+  "duration_ms": 83,
+  "fault": null,
+  "invariants": [
+    {
+      "version_gate_boundary_fails_closed_below_the_route": "pass: the same 51.0.0 boundary probed against the real legacy binary (cloud-hypervisor v43.0.0 at /usr/bin/cloud-hypervisor) — unproven — refused the notification fail-closed before any VMM call, the durable record carrying the gate's reason"
+    },
+    {
+      "notification_contract_both_ways": "pass: the notification's composed status is a real observation (the notification landed (a 2xx from the real VMM's resize-disk route at this binary's version)); the refused version gate fails closed before any VMM call"
+    },
+    {
+      "version_gate_probed_from_the_real_binary": "pass: every gate leg probed a real binary's --version output through the real runner (the run binary at the route's boundary 51.0.0 and the refused control 99.0.0, and the same boundary unproven against the real legacy binary (cloud-hypervisor v43.0.0))"
+    }
+  ],
+  "kernel": "6.8.0-142-generic",
+  "logs": {
+    "destination_journal": "/root/git/volvisor/target/campaign-evidence/run-520854/logs/tier-v/resize-notification/b/journal.log",
+    "journal": "/root/git/volvisor/target/campaign-evidence/run-520854/logs/tier-v/resize-notification/a/journal.log",
+    "migration_records": "/root/git/volvisor/target/campaign-evidence/run-520854/logs/tier-v/resize-notification/a/migrations",
+    "peer_preparations": "/root/git/volvisor/target/campaign-evidence/run-520854/logs/tier-v/resize-notification/b/peer-preparations",
+    "witness": "/root/git/volvisor/target/campaign-evidence/run-520854/logs/tier-v/resize-notification/witness"
+  },
+  "oracle": null,
+  "outcome": "complete: the P6 grow notification was driven against a real VMM — the version gate at the route's boundary (51.0.0) and the refused control (99.0.0) probed from real --version output, and the same boundary unproven against the real legacy binary (cloud-hypervisor v43.0.0), the fail-closed retry contract, and the retry pass",
+  "scenario": "tier-v/resize-notification",
+  "tier": "V"
+}
