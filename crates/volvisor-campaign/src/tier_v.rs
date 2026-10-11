@@ -36,6 +36,7 @@
 //! | Variable | Meaning | Default |
 //! |---|---|---|
 //! | `VOLVISOR_TEST_VMM_CLOUD_HYPERVISOR` | the VMM binary | `cloud-hypervisor` on `PATH` |
+//! | `VOLVISOR_TEST_VMM_CLOUD_HYPERVISOR_LEGACY` | an optional second, older VMM binary for the resize scenario's version-gate boundary leg (explicit only — never a `PATH` fallback, which would re-find the primary) | unset — the leg is honestly absent from the record |
 //! | `VOLVISOR_TEST_VMM_CH_REMOTE` | the adapter binary | `ch-remote` on `PATH` |
 //! | `VOLVISOR_TEST_VMM_KERNEL` | direct-boot kernel | `/boot/vmlinuz-$(uname -r)` |
 //! | `VOLVISOR_TEST_VMM_INITRAMFS` | direct-boot initramfs | `/boot/initrd.img-$(uname -r)` |
@@ -167,6 +168,28 @@ pub struct RealVmmEnv {
     pub cloud_hypervisor_sha256: String,
     /// The ch-remote binary's SHA256 (64 lowercase hex).
     pub ch_remote_sha256: String,
+    /// An optional second, older cloud-hypervisor binary claimed for
+    /// the resize scenario's version-gate boundary leg: the same
+    /// minimum probed against a binary below it — refused
+    /// fail-closed, recorded from the real binary's `--version`
+    /// output. Absent unless
+    /// `VOLVISOR_TEST_VMM_CLOUD_HYPERVISOR_LEGACY` claims it.
+    pub legacy_cloud_hypervisor: Option<LegacyCloudHypervisor>,
+}
+
+/// The optional older cloud-hypervisor binary the resize scenario's
+/// boundary leg probes (ADR-0010's stamp discipline applies to it
+/// too: a probed binary is named with its version + SHA256, never an
+/// anonymous `--version` output).
+#[derive(Clone, Debug)]
+pub struct LegacyCloudHypervisor {
+    /// The binary (resolved, existing — the claim is explicit, never
+    /// a `PATH` fallback that would re-find the primary).
+    pub path: PathBuf,
+    /// The `--version` first line (e.g. `cloud-hypervisor v43.0.0`).
+    pub version: String,
+    /// The binary's SHA256 (64 lowercase hex).
+    pub sha256: String,
 }
 
 /// The running kernel's release (`/proc/sys/kernel/osrelease`) —
@@ -302,11 +325,30 @@ pub fn detect_real_vmm() -> Result<RealVmmEnv, String> {
                 .to_owned(),
         );
     }
+    // The optional legacy binary: an explicit claim only. Set but
+    // missing is the loud failure (the same rule as every override);
+    // unset is the honest absence — the boundary leg simply does not
+    // run, and the record states what it observed.
+    let legacy_cloud_hypervisor =
+        if std::env::var_os("VOLVISOR_TEST_VMM_CLOUD_HYPERVISOR_LEGACY").is_some() {
+            let path = resolve_binary(
+                "VOLVISOR_TEST_VMM_CLOUD_HYPERVISOR_LEGACY",
+                "cloud-hypervisor",
+            )?;
+            Some(LegacyCloudHypervisor {
+                version: version_first_line(&path)?,
+                sha256: sha256_file(&path)?,
+                path,
+            })
+        } else {
+            None
+        };
     Ok(RealVmmEnv {
         cloud_hypervisor_version: version_first_line(&cloud_hypervisor)?,
         ch_remote_version: version_first_line(&ch_remote)?,
         cloud_hypervisor_sha256: sha256_file(&cloud_hypervisor)?,
         ch_remote_sha256: sha256_file(&ch_remote)?,
+        legacy_cloud_hypervisor,
         cloud_hypervisor,
         ch_remote,
         kernel,
@@ -324,25 +366,35 @@ impl RealVmmEnv {
     /// CG5 scans for on Tier V records.
     #[must_use]
     pub fn components_value(&self) -> Value {
+        let mut vmm = json!({
+            "cloud_hypervisor": {
+                "path": self.cloud_hypervisor.display().to_string(),
+                "version": self.cloud_hypervisor_version,
+                "sha256": self.cloud_hypervisor_sha256,
+            },
+            "ch_remote": {
+                "path": self.ch_remote.display().to_string(),
+                "version": self.ch_remote_version,
+                "sha256": self.ch_remote_sha256,
+            },
+            "guest": "direct kernel boot (host kernel + initramfs to a busybox \
+                      shell on ttyS0); the guest issues no disk I/O — the write \
+                      workload is the rig's model through the simulated device",
+            "storage_below_the_seam": "simulated (the campaign's fake DRBD worlds; \
+                                       file-backed disks at the DRBD device paths)",
+        });
+        if let Some(legacy) = &self.legacy_cloud_hypervisor {
+            vmm["legacy_cloud_hypervisor"] = json!({
+                "path": legacy.path.display().to_string(),
+                "version": legacy.version,
+                "sha256": legacy.sha256,
+                "role": "the resize scenario's version-gate boundary leg: its --version \
+                         probed through the real runner, never a launched VMM",
+            });
+        }
         json!({
             "volvisord": "in-process daemons over the real router (the campaign rig)",
-            "vmm": {
-                "cloud_hypervisor": {
-                    "path": self.cloud_hypervisor.display().to_string(),
-                    "version": self.cloud_hypervisor_version,
-                    "sha256": self.cloud_hypervisor_sha256,
-                },
-                "ch_remote": {
-                    "path": self.ch_remote.display().to_string(),
-                    "version": self.ch_remote_version,
-                    "sha256": self.ch_remote_sha256,
-                },
-                "guest": "direct kernel boot (host kernel + initramfs to a busybox \
-                          shell on ttyS0); the guest issues no disk I/O — the write \
-                          workload is the rig's model through the simulated device",
-                "storage_below_the_seam": "simulated (the campaign's fake DRBD worlds; \
-                                           file-backed disks at the DRBD device paths)",
-            },
+            "vmm": vmm,
             "drbd-tooling": "fake",
             "witness": "in-process",
         })
@@ -429,11 +481,17 @@ pub const SCENARIOS: &[Scenario] = &[
         skip_reason: GATE_SKIP_REASON,
         body: "boot a real guest with a real disk file; attach the volume naming the \
                VMM's disk id; grow the backing file out-of-band; GrowVolume through the \
-               public route with the version gate probed from the real binary's \
+               public route with the version gate pinned at the route's boundary \
+               (51.0.0 — below every live-verified route-carrying binary, above every \
+               live-verified route-absent one) and probed from the real binary's \
                --version output; observe the notification's typed outcome against the \
                real VMM — a 2xx completion, or the typed refusal with the HTTP status \
                carried and the durable retry_required record (the fail-closed contract) \
-               — and the retry pass's re-drive",
+               — and the retry pass's re-drive; the always-refused control (99.0.0); \
+               and, when an older binary is claimed via \
+               VOLVISOR_TEST_VMM_CLOUD_HYPERVISOR_LEGACY, the same boundary minimum \
+               probed against it — unproven, the notification refused before any VMM \
+               call",
     },
 ];
 
