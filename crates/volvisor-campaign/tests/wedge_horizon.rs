@@ -34,10 +34,13 @@
 //! [`fresh_grant_refused_at_promote_parks_honestly`] (gate b — a
 //! re-mint would fence a legitimate promote),
 //! [`fresh_grant_never_mints_over_a_live_member`] (the still-live
-//! boundary — the mixed park spins, the re-mint never fires), and
+//! boundary — the mixed park spins, the re-mint never fires),
 //! [`fresh_grant_refused_when_the_world_moved`] (the source's host
 //! re-granted over the dead lease — a live foreign lease is never
-//! re-minted over).
+//! re-minted over), and
+//! [`undriven_mixed_park_lapses_to_the_fresh_grant`] — the composite:
+//! an undriven mixed park is left to lapse by the coupling, and the
+//! now-uniformly-dead park converges through the re-mint.
 //!
 //! Time compression: the rig's frozen witness clock plus its 100 s
 //! lease TTL (the existing §3.3 seam — no new seam introduced). A
@@ -483,6 +486,46 @@ async fn verify_parked_data_n(
     }
     let boundary = joined[0].1.clone();
     (acked, boundary)
+}
+
+/// The composite's journal shape: exactly one re-mint attempt
+/// spent, the witness journal holding exactly one grant-set intent
+/// under the attempt-1 derived id (the re-mint fired once — over
+/// the uniformly-dead park, never over the live member).
+async fn assert_single_re_mint_shape(rig: &mut Rig, mig: &str) {
+    let preparation = rig
+        .b
+        .peer_preparations
+        .load(&MigrationId::new(mig).expect("valid id"))
+        .expect("load the preparation")
+        .expect("the preparation is on record");
+    assert_eq!(
+        preparation.grant_attempt, 1,
+        "exactly one re-mint attempt was spent"
+    );
+    rig.witness.stop().await;
+    let records = journal_records(&rig.witness.dir).await;
+    let reissue_ids: Vec<&str> = records
+        .iter()
+        .filter_map(|record| match record {
+            JournalRecord::Intent(intent) => intent
+                .operation_id
+                .as_str()
+                .starts_with("derived:mig-grant-set-r")
+                .then_some(intent.operation_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reissue_ids.len(),
+        1,
+        "exactly one re-mint intent reached the witness: {reissue_ids:?}"
+    );
+    assert!(
+        reissue_ids[0].starts_with("derived:mig-grant-set-r1-"),
+        "the re-mint fired under the attempt-1 id: {reissue_ids:?}"
+    );
+    rig.witness.restart().await;
 }
 
 /// The divergence and the coupling observation (the mixed-liveness
@@ -1341,6 +1384,145 @@ async fn fresh_grant_never_mints_over_a_live_member() {
          dead member's tail needs a lease the re-mint may not mint over it; the spin \
          is bounded and typed, recovery is operator territory (never weakened to make \
          this scenario pass)",
+    );
+    let record = emit_oracle_n(
+        &rig,
+        evidence,
+        &acked,
+        boundary,
+        "destination",
+        Some(&summary),
+    );
+    assert!(record.is_file(), "the evidence record landed: {record:?}");
+}
+
+/// **The undriven mixed park, walked end to end (the composite):**
+/// the two halves the boundary scenarios pin separately — the
+/// uniform-liveness coupling (a mixed preparation is skipped whole
+/// by the renewal) and the uniformly-dead re-mint — compose into
+/// one path: a mixed park that stays UNDRIVEN (the source held
+/// down, no promote ever attempted over the live member) is left to
+/// lapse by the renewal's own coupling, the survivor's lease dying
+/// with the frozen clock past its end and the W7 fence window, and
+/// the now-uniformly-dead park selects the fresh grant: the re-mint
+/// fires under the attempt-1 id, the promotes complete, and the
+/// migration converges at epoch exactly 3. The boundary scenario's
+/// spin is what a DRIVEN mixed park becomes; this is what an
+/// undriven one always was — self-resolving by construction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn undriven_mixed_park_lapses_to_the_fresh_grant() {
+    let seq = next_id();
+    let (mut rig, writers, _transports) = live_scenario_n(&format!("whc{seq}"), 2).await;
+    let mut evidence = Evidence::new("wedge-horizon/mixed-liveness/undriven-lapse-converges");
+    evidence.fault(
+        "partial_renewal_divergence_left_undriven",
+        "one participant's lease renewed past its sibling's death (the manual \
+         divergence a partial renewal leaves), the park left undriven while the \
+         survivor's lease lapses and the uniformly-dead gate opens",
+    );
+    prepare(&rig, "mig-x").await;
+    wedge_park(&rig, "mig-x").await;
+    rig.witness.restart().await;
+    await_view(&rig, &vol_id(&rig, 0), 2, PEER_NODE, true).await;
+    await_view(&rig, &vol_id(&rig, 1), 2, PEER_NODE, true).await;
+    // The source dies: the park stays UNDRIVEN — no re-drive ever
+    // attempts the live member's promote (the boundary scenario's
+    // driven shape is what turns this park operator territory; the
+    // undriven one self-resolves).
+    rig.a.stop().await;
+
+    // The divergence and the coupling observation (the shared
+    // helper): one member renewed past its sibling's death, then the
+    // grant-hold pass's refusal to re-renew the survivor — the
+    // preparation is not uniformly live, and the coupling is what
+    // leaves the survivor to lapse instead of blocking the gate.
+    assert_uniform_liveness_coupling(&rig).await;
+
+    // THE LAPSE: the frozen clock crosses the survivor's renewed end
+    // (START+CLOCK_STEP+TTL — the manual renew extended from the
+    // divergence clock) and its W7 fence window, well past both
+    // members' ends. The preparation is now UNIFORMLY dead: the
+    // shape the fresh-grant gate arbitrates.
+    let survivor_end = volvisor_campaign::rig::START + CLOCK_STEP + TTL;
+    let now = rig.clock.load(Ordering::SeqCst);
+    rig.clock
+        .fetch_add(survivor_end + 150 - now, Ordering::SeqCst);
+    await_view(&rig, &vol_id(&rig, 0), 2, PEER_NODE, false).await;
+    await_view(&rig, &vol_id(&rig, 1), 2, PEER_NODE, false).await;
+    evidence.invariant(
+        "uniform_liveness_lapsed_uniformly_dead",
+        "pass: the mixed preparation was skipped whole by the grant-hold renewal \
+         (the survivor's remaining fell with the clock, never reset), and the \
+         survivor's lease then lapsed with the clock — the park is uniformly dead",
+    );
+
+    // The source returns: the re-drive's authorize sees the dead
+    // leases, the grant route re-issues, the act's gates pass (every
+    // participant Expired and ours, the park provably pre-promote —
+    // no device path was ever recorded over the live member — the
+    // fence evidence intact), and the re-mint fires under the
+    // attempt-1 derived id.
+    rig.a.restart().await;
+    let summary = poll_migration(rig.a.addr, "mig-x", "complete").await;
+    let history: Vec<&str> = summary["state_history"]
+        .as_array()
+        .expect("the summary carries the state history")
+        .iter()
+        .map(|entry| entry["state"].as_str().expect("a state name"))
+        .collect();
+    let authorized = history
+        .iter()
+        .position(|state| *state == "destination_authorized")
+        .expect("the park landed destination_authorized");
+    let resumed = history
+        .iter()
+        .position(|state| *state == "vm_resumed")
+        .expect("the re-mint drove the restore and resume");
+    assert!(
+        authorized < resumed,
+        "the recovered path is ordered: {history:?}"
+    );
+    assert_eq!(
+        rig.vmm_a.vm_state(&rig.vm).expect("the source VM observes"),
+        VmState::Absent,
+        "the source VM stays destroyed (the cut is durable)"
+    );
+    for index in 0..2 {
+        assert_eq!(
+            role_of(&rig.world_a, &rig.resources()[index]),
+            Role::Secondary,
+            "volume {index}: the source stays demoted (fenced, never resumed)"
+        );
+        assert_eq!(
+            role_of(&rig.world_b, &rig.resources()[index]),
+            Role::Primary,
+            "volume {index}: the destination promoted through the re-minted grant"
+        );
+        evidence.invariant(
+            "w1_w5_no_double_grant",
+            &assert_w1_w5_vol(&rig, &vol_id(&rig, index), 3, PEER_NODE, true).await,
+        );
+        evidence.invariant(
+            "g5_barrier",
+            &assert_g5_complete(&rig, &vol_id(&rig, index), "mig-x").await,
+        );
+    }
+
+    // The horizon remedy's journal shape (the helper below): exactly
+    // one attempt spent, the witness journal holding the r1
+    // grant-set intent (the re-mint fired once — over the
+    // uniformly-dead park, never over the live member).
+    assert_single_re_mint_shape(&mut rig, "mig-x").await;
+
+    // The data-path oracle over both volumes (the converged shape).
+    let (acked, boundary) = verify_parked_data_n(&rig, writers).await;
+    evidence.outcome(
+        "recovered: COMPLETE through the composed path — the undriven mixed park \
+         was skipped whole by the grant-hold renewal (the coupling), the survivor's \
+         lease lapsed with the clock, and the now-uniformly-dead park selected the \
+         fresh grant: the re-mint fired under the attempt-1 id (epoch exactly 3, \
+         exactly one re-mint intent at the witness), the promotes completed under \
+         it, and the acknowledged prefix is byte-exact at the destination",
     );
     let record = emit_oracle_n(
         &rig,

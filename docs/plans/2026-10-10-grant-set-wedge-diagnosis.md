@@ -190,12 +190,20 @@ Its fully-promoted
 participants still converge through the promote replay, but the mixed
 park's un-promoted tail needs a lease the re-mint may not mint; the
 **revoked-lease park** (row 12b's fail-closed release) is refused
-(gate a) — a deliberate end is never silently reversed; and the
+(gate a's revoked arm: a lease still recorded held by this
+destination that the witness reports revoked is a deliberate end —
+the refusal is typed BEFORE any witness grant call, so no path
+converts it; a lease revoked by another host is that host's own
+release, the ordinary pre-grant shape the witness grants over) —
+and the
 **mixed-liveness park** (one member lapsed, another still live)
 self-resolves only while it stays undriven: the uniform rule skips
 the whole preparation (the renewal never blocks the gate), so the
 still-live member lapses within one TTL and the uniformly-dead gate
-opens. Once the drive re-engages over a mixed park the boundary is
+opens — the review round's composite scenario walks exactly this
+path end to end (the undriven mixed park lapses to uniformly dead
+and converges through the re-mint). Once the drive re-engages over
+a mixed park the boundary is
 different — the still-live member's promote lands under its lease
 (the renewal mechanism's purpose), and the park that remains is the
 mixed at-promote shape: the un-promoted tail's dead lease is refused

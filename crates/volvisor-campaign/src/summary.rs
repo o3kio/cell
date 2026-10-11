@@ -59,17 +59,20 @@ use crate::tier_v;
 /// without a wall-clock harness.
 ///
 /// *Amendment (PR #33, the wedge-horizon family):* the bound is
-/// 90s, not 60s. The family's seven scenarios observe production
+/// 90s, not 60s. The family's eight scenarios observe production
 /// cadences in real time — that is the thing they exist to prove,
 /// not an accident to optimize away (the PR #21 row-3 precedent):
 /// three spin watches (one full `MIGRATION_RETRY_TICK` plus the
-/// amendment's ~3s load headroom each), one coupling watch (three
-/// grant-hold renewal passes at the rig's 1s tick), one convergence
-/// that arrives on the retry task's own tick, and three
-/// renewal-step observations — ~36s of designed waits, measured
-/// ~35s serialized for the family against ~34s for the rest of the
-/// campaign (the pre-#33 sum), so the amended bound carries the
-/// measured ~71s whole-campaign sum plus load headroom.
+/// amendment's ~3s load headroom each), the mixed-liveness coupling
+/// observations (the boundary and its composite; three grant-hold
+/// renewal passes at the rig's 1s tick), one convergence that
+/// arrives on the retry task's own tick, and three renewal-step
+/// observations — the family measures ~36s serialized against ~34s
+/// for the rest of the campaign, so the amended bound carries the
+/// measured whole-campaign sum — 65–74s across the runs at the
+/// heads involved (a skip-mode suite without the gated Tier V
+/// records at the low end, the full merge with them at the high
+/// end) — plus load headroom.
 pub const SUITE_BOUND_MS: u64 = 90_000;
 
 // ---------------------------------------------------------------------------
@@ -1261,9 +1264,13 @@ const FINDINGS: &[(&str, &str)] = &[
          exactly the genuinely unresolvable: the at-promote park (row 12b's stable \
          typed promote refusal — a re-mint would fence a legitimate promote, and the \
          destination's own restart reconciliation self-fences the unprovable writer), \
-         the mixed park once its live member has promoted, and a world that moved \
-         (a foreign re-grant over the dead lease) — operator territory, each proven \
-         to spin typed rather than weakened to pass. Within that horizon the \
+         the mixed park once its live member has promoted (an undriven mixed park, \
+         by contrast, self-resolves: the coupling leaves the survivor to lapse and \
+         the uniformly-dead gate opens — the composite scenario walks it end to end), \
+         the revoked-lease park (a deliberate end — gate a's revoked arm refuses it \
+         typed before any witness call, never silently reversed), and a world that \
+         moved (a foreign re-grant over the dead lease) — operator territory, each \
+         proven to spin typed rather than weakened to pass. Within that horizon the \
          canonical-state-plus-stall-detail \
          reading holds, and IN_DOUBT stays reserved for genuinely unresolvable \
          stalls through the observe mapping of SOURCE_REVOKED \

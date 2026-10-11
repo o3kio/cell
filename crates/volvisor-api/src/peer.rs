@@ -1891,6 +1891,35 @@ async fn grant_act(
         .all(|(view, _)| {
             view.lease_state == LeaseState::Expired && view.holder.as_ref() == Some(&ctx.host_id)
         });
+    // Gate (a)'s revoked arm: a revoked lease still recorded held by
+    // THIS host is a DELIBERATE end of this destination's own grant
+    // (an abort's fail-closed release — row 12b's shape), and a
+    // deliberate end is never silently reversed. The re-mint is
+    // gated on the lapsed shape (expired, still this host's); a
+    // revoked-and-ours lease refuses typed before any witness grant
+    // call — never the replay's implicit promote-refusal, and never
+    // the fresh-execution arm (which would mint a new epoch over the
+    // deliberate end): no path converts it. A revoked lease held by
+    // ANOTHER host is the cut's own release (the source's
+    // fail-closed surrender — the ordinary pre-grant shape the
+    // witness grants over past its fence window) and does not fire
+    // this arm.
+    if needs_lease
+        && views.iter().any(|view| {
+            view.lease_state == LeaseState::Revoked && view.holder.as_ref() == Some(&ctx.host_id)
+        })
+    {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidState,
+            format!(
+                "the recorded grant of migration {} is revoked (a deliberate end — an abort's \
+                 fail-closed release); the fresh-grant re-mint is gated on the lapsed shape \
+                 (every participant's lease expired and still held by this host) and no path \
+                 converts a revoked lease — the park is operator territory",
+                req.migration_id
+            ),
+        ));
+    }
     // The witness batch operation id: derived over the ordered
     // participant volume set, exactly like the source's own batch ids,
     // so a re-drive replays the recorded outcome instead of minting a
@@ -1977,10 +2006,11 @@ async fn grant_act(
     } else {
         // Not the uniformly-lapsed shape: the grant may never have
         // landed (no journal entry — the witness executes it fresh
-        // under the current attempt's id), or the lease is foreign,
-        // revoked or mixed — today's semantics in every case: the
-        // witness replays-or-executes and the promotes answer for
-        // themselves.
+        // under the current attempt's id), or the lease is foreign
+        // or mixed — today's semantics in every case: the witness
+        // replays-or-executes and the promotes answer for
+        // themselves (a revoked lease never reaches here: gate (a)'s
+        // revoked arm refuses it typed before the witness call).
         grant_witness_operation_id(
             &req.migration_id,
             &id_only_participants(&preparation),

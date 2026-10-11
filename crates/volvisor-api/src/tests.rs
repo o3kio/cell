@@ -3274,6 +3274,19 @@ impl FakePeerWitness {
         );
     }
 
+    /// Script the volume's lease as revoked while still recorded
+    /// held by this host (a deliberate end — an abort's fail-closed
+    /// release, row 12b's shape; gate (a)'s revoked arm's input).
+    fn set_revoked(&self, volume: &volvisor_types::VolumeId, epoch: u64, lease_id: u64) {
+        self.set_volume(
+            volume,
+            epoch,
+            lease_id,
+            volvisor_types::LeaseState::Revoked,
+            0,
+        );
+    }
+
     /// Script the volume state (the shared tail of the setters above).
     fn set_volume(
         &self,
@@ -4927,6 +4940,118 @@ async fn peer_grant_refuses_the_re_mint_when_the_fence_evidence_moved() {
             .grant_attempt,
         0
     );
+}
+
+/// Gate (a)'s revoked arm, the negative: the witness reports the
+/// participants' leases as `Revoked` while still recorded held by
+/// this host — a deliberate end (an abort's fail-closed release,
+/// row 12b's shape). The re-mint refuses typed BEFORE any witness
+/// grant call (never the replay's implicit promote-refusal, never
+/// the fresh-execution arm that would mint over the deliberate
+/// end): the module docs' "a revoked or foreign lease never
+/// re-mints", pinned — and the refusal reproduces identically on
+/// the re-drive (the park keeps its typed spin).
+#[tokio::test]
+async fn peer_grant_refuses_the_re_mint_when_the_lease_was_revoked() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-h5").await;
+    create_volume(&kit, "vol-h5b").await;
+    let migration = migration_id("mig-h5");
+    for raw in ["vol-h5", "vol-h5b"] {
+        let volume = volume_id(raw);
+        kit.witness.set_revoked(&volume, 2, 1);
+        kit.witness.set_barrier(&volume, &migration, 1);
+        kit.witness.set_retired(&volume, 1);
+    }
+    kit.store
+        .install(&TargetPreparation {
+            migration_id: migration.clone(),
+            vm_id: "vm-h5".to_owned(),
+            source_host: host_id("src-host"),
+            target_host: kit.host.clone(),
+            participants: vec![
+                PreparedParticipant {
+                    volume_id: volume_id("vol-h5"),
+                    expected_generation: 1,
+                    device_path: None,
+                },
+                PreparedParticipant {
+                    volume_id: volume_id("vol-h5b"),
+                    expected_generation: 1,
+                    device_path: None,
+                },
+            ],
+            grant_attempt: 0,
+            created_at: 1,
+        })
+        .expect("install preparation");
+
+    // The act refuses typed — twice (the re-drive's re-execution
+    // reproduces the refusal identically: the spin is typed, never
+    // silent).
+    for redrive in 0..2 {
+        let (status, body) = send_json(
+            &app,
+            peer_request(
+                Method::POST,
+                "/v2/internal/peer/grant",
+                &json!({"migration_id": "mig-h5"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "re-drive {redrive}: {body}");
+        assert_eq!(body["code"], json!("INVALID_STATE"), "re-drive {redrive}");
+        let message = body["message"].as_str().expect("message");
+        assert!(
+            message.contains("revoked"),
+            "the refusal names the deliberate end: {message}"
+        );
+        assert!(
+            message.contains("deliberate end"),
+            "the refusal states the lease's meaning: {message}"
+        );
+        assert!(
+            message.contains("no path converts a revoked lease"),
+            "the refusal states the guarantee: {message}"
+        );
+        assert!(
+            message.contains("operator territory"),
+            "the refusal states the park's disposition: {message}"
+        );
+    }
+    assert_eq!(
+        kit.witness.grant_set_calls.lock().expect("calls").len(),
+        0,
+        "no witness grant call — no path mints over the revoked lease"
+    );
+    assert_eq!(kit.handoff.promotes.lock().expect("promotes").len(), 0);
+    assert_eq!(
+        kit.store
+            .load(&migration)
+            .expect("load")
+            .expect("installed")
+            .grant_attempt,
+        0,
+        "the attempt counter is never bumped on a refusal"
+    );
+    // The leases stay revoked — the scripted deliberate end is
+    // intact, no path converted it.
+    {
+        let volumes = kit.witness.volumes.lock().expect("volumes");
+        for raw in ["vol-h5", "vol-h5b"] {
+            let entry = volumes.get(&volume_id(raw)).expect("the scripted lease");
+            assert_eq!(
+                entry.lease_state,
+                volvisor_types::LeaseState::Revoked,
+                "{raw}: the lease stays revoked"
+            );
+            assert_eq!(
+                entry.epoch, 2,
+                "{raw}: the granted epoch never moved (no mint over the deliberate end)"
+            );
+        }
+    }
 }
 
 /// The still-live negative: while any participant's lease is still
