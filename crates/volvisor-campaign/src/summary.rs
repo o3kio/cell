@@ -57,7 +57,23 @@ use crate::tier_v;
 /// (the binaries and the cells run with bounded parallelism, so
 /// wall time is at most the sum), which keeps the check honest
 /// without a wall-clock harness.
-pub const SUITE_BOUND_MS: u64 = 60_000;
+///
+/// *Amendment (PR #33, the wedge-horizon family):* the bound is
+/// 90s, not 60s. The family's eight scenarios observe production
+/// cadences in real time — that is the thing they exist to prove,
+/// not an accident to optimize away (the PR #21 row-3 precedent):
+/// three spin watches (one full `MIGRATION_RETRY_TICK` plus the
+/// amendment's ~3s load headroom each), the mixed-liveness coupling
+/// observations (the boundary and its composite; three grant-hold
+/// renewal passes at the rig's 1s tick), one convergence that
+/// arrives on the retry task's own tick, and three renewal-step
+/// observations — the family measures ~36s serialized against ~34s
+/// for the rest of the campaign, so the amended bound carries the
+/// measured whole-campaign sum — 65–74s across the runs at the
+/// heads involved (a skip-mode suite without the gated Tier V
+/// records at the low end, the full merge with them at the high
+/// end) — plus load headroom.
+pub const SUITE_BOUND_MS: u64 = 90_000;
 
 // ---------------------------------------------------------------------------
 // The §9 mapping (static, reviewable — CG1's executable form)
@@ -1225,27 +1241,41 @@ const FINDINGS: &[(&str, &str)] = &[
          re-issue re-executes and the refusal reproduces identically each retry tick.",
     ),
     (
-        "The IN_DOUBT contract nuance (stage-B round-2 review; RESOLVED by the wedge fix)",
+        "The IN_DOUBT contract nuance (stage-B round-2 review; RESOLVED, then the horizon closed)",
         "Nearline §6 reserves IN_DOUBT for unresolvable stalls (a failed barrier void, \
          a dead destination VMM) and directs that a resolvable post-authorization stall \
          be reported as the canonical state plus a stall detail. The wedge strained the \
          'resolvable' reading: its park reported 'stalled' forever while the migration \
-         was permanently parked. The wedge fix RESOLVES the question in the contract's \
-         favor: a destination_authorized-shaped stall is now self-resolvable by \
-         construction while the witness-side grant remains live (the 60 s lease TTL — \
-         the retry re-issues the failed peer act and converges, proven by the healed \
-         row-7 cells and row 8); a park that outlives the minted leases (an unpromoted \
-         grant-hold lease is never renewed — the renewal pass iterates only the \
-         provider's own volumes) spins honestly with no re-mint path, the remedy \
-         directions (renewing unpromoted grant-hold leases during a park, or a \
-         fresh-grant epoch when the recorded grant's lease is provably dead) being a \
-         recorded follow-up, not shipped. Within that horizon the \
+         was permanently parked. The wedge fix (PR #23) RESOLVED the question in the \
+         contract's favor: a destination_authorized-shaped stall is self-resolvable by \
+         construction while the witness-side grant remains live (the retry re-issues \
+         the failed peer act and converges, proven by the healed row-7 cells and row \
+         8). The remaining horizon — a park that outlives the minted leases — is now \
+         closed too (PR #33, the convergence-horizon remedy): the destination's \
+         renewal task renews the grant-hold leases of its live pre-promote \
+         preparations (uniform-liveness coupled, so a preparation with a dead member \
+         is skipped whole and converges to the shape the gate arbitrates), and when \
+         the leases are nevertheless dead the grant act re-issues under a fresh \
+         derived operation id behind three witness-authoritative gates (every \
+         participant's lease Expired and still this host's, the park provably \
+         pre-promote, the cut's fence evidence intact) — the wedge-horizon scenarios \
+         prove both convergences (epoch exactly 2 through the renewal, exactly 3 \
+         through the re-mint) and every honest boundary. What remains IN_DOUBT is \
+         exactly the genuinely unresolvable: the at-promote park (row 12b's stable \
+         typed promote refusal — a re-mint would fence a legitimate promote, and the \
+         destination's own restart reconciliation self-fences the unprovable writer), \
+         the mixed park once its live member has promoted (an undriven mixed park, \
+         by contrast, self-resolves: the coupling leaves the survivor to lapse and \
+         the uniformly-dead gate opens — the composite scenario walks it end to end), \
+         the revoked-lease park (a deliberate end — gate a's revoked arm refuses it \
+         typed before any witness call, never silently reversed), and a world that \
+         moved (a foreign re-grant over the dead lease) — operator territory, each \
+         proven to spin typed rather than weakened to pass. Within that horizon the \
          canonical-state-plus-stall-detail \
          reading holds, and IN_DOUBT stays reserved for genuinely unresolvable \
-         stalls — row 12b's shape (a stable typed promote refusal the operator must \
-         clear), which parks IN_DOUBT through the observe mapping of SOURCE_REVOKED \
+         stalls through the observe mapping of SOURCE_REVOKED \
          ('source revoked; destination grant not yet authorized'). No contract change \
-         was needed; the resolution is recorded here and in PR #23.",
+         was needed; the resolution is recorded here, in PR #23 and in PR #33.",
     ),
     (
         "The row-9 lineage gap (found by this campaign, fixed)",

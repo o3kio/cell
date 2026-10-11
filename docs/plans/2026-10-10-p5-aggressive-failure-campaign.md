@@ -321,6 +321,29 @@ which made the budget a tightrope instead of a budget. The amended
 bound is derived: one full retry tick (5s) plus ~3s of re-drive,
 observation and load headroom.
 
+*Amendment (PR #33, the wedge-horizon family):* the whole-campaign
+bound is 90s, not 60s. The convergence-horizon scenarios (the
+grant-hold renewal during parks and the gated fresh-grant re-mint)
+observe production cadences in real time — the same class of
+designed wait as row 3's peer-grant cells, the thing the scenarios
+exist to prove: three of the negatives watch a parked park refuse
+on the daemon's own retry tick (one full 5s tick plus the row-3
+amendment's ~3s headroom each), the mixed-liveness boundary and its
+composite observe the grant-hold renewal pass at the rig's 1s
+renewal tick (the boundary three passes; the composite's coupling
+observation the same), the fresh-grant convergence arrives on the
+retry task's own tick (the row-3 cells' exact shape), and the
+renewal convergence observes three due-window steps. The family
+measures ~36s serialized across its eight scenarios (the waits
+dominate; the re-drives themselves are fired through the retry
+task's startup sweep where the cadence is not the subject — the
+healed cells' precedent) against ~34s for the rest of the campaign,
+so the amended bound carries the measured whole-campaign sum —
+65–74s across the runs at the heads involved (the low end a
+skip-mode suite without the gated Tier V records, the high end the
+full merge with them, run-to-run variance in the cell durations in
+between) — plus load headroom; the per-family bounds are unchanged.
+
 ### 3.3 What "kill" means (the task-group model)
 
 A real `kill -9` removes the process: server, background tasks, locks,

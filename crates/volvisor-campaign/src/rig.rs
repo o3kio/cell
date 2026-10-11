@@ -34,6 +34,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
+use volvisor_api::peer::{PeerRouteContext, TargetPreparationStore};
 use volvisor_api::{AppState, CrashHooks, KillSwitch, router};
 use volvisor_drbd::AuthorityContext;
 use volvisor_drbd::provider::{DrbdProvider, DrbdProviderConfig, resource_name_for};
@@ -689,6 +690,11 @@ pub struct Daemon {
     /// every launch — see the core's `make_provider` method; the
     /// store-save seams a scenario arms hang off it).
     pub provider: Arc<DrbdProvider>,
+    /// This launch's peer-preparation store handle (the
+    /// destination-side preparation records; the horizon remedy's
+    /// store-save seam — the attempt-counter bump and the
+    /// device-path recordings — arms hang off it).
+    pub peer_preparations: TargetPreparationStore,
 }
 
 impl Daemon {
@@ -764,8 +770,23 @@ impl Daemon {
         // `spawn_renewal_task` is private, so the loop is
         // re-implemented over the public `renew_leases` surface —
         // the same tick shape, every outcome a structured event,
-        // never a crash).
-        let renewal = spawn_renewal_loop(Arc::clone(&provider));
+        // never a crash). The grant-hold leg mirrors production's
+        // horizon wiring through the same peer context the routes
+        // share.
+        let renewal = spawn_renewal_loop(Arc::clone(&provider), Arc::clone(&peer_ctx));
+
+        // The preparation store's store-save seam is fresh per
+        // `wire_migration` call too (the store re-opens the same
+        // durable directory): register the same kill switch so a
+        // preparation-save kill (the attempt-counter bump, a
+        // device-path recording) fires into the same group — the
+        // horizon remedy's durable boundaries are kill-testable
+        // exactly like every other store's.
+        peer_ctx
+            .preparations()
+            .store_crash_hooks()
+            .set_kill_switch(core.kill_switch());
+        let peer_preparations = peer_ctx.preparations().clone();
 
         let state = AppState::new(
             Arc::clone(&provider) as Arc<dyn VolumeProvider>,
@@ -803,6 +824,7 @@ impl Daemon {
             addr,
             handle,
             provider,
+            peer_preparations,
         }
     }
 
@@ -871,8 +893,13 @@ impl Daemon {
 /// over the public [`DrbdProvider::renew_leases`] surface — the
 /// same tick shape, every outcome a structured event, never a
 /// crash; a dead witness or a killed daemon surfaces as an error
-/// event the loop outlives).
-fn spawn_renewal_loop(provider: Arc<DrbdProvider>) -> JoinHandle<()> {
+/// event the loop outlives). The grant-hold leg mirrors production's
+/// horizon wiring: the peer context's pre-promote lease renewal runs
+/// in the same tick, at the rig's renewal cadence.
+fn spawn_renewal_loop(
+    provider: Arc<DrbdProvider>,
+    grant_holds: Arc<PeerRouteContext>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(RENEWAL_TICK).await;
@@ -891,6 +918,39 @@ fn spawn_renewal_loop(provider: Arc<DrbdProvider>) -> JoinHandle<()> {
                         kind = "renew_leases",
                         error = %error,
                         "campaign renewal pass failed"
+                    );
+                }
+            }
+            match grant_holds.renew_grant_hold_leases(INTERVAL).await {
+                Ok(report) => {
+                    for renewed in &report.renewed {
+                        tracing::info!(
+                            kind = "renew_grant_hold",
+                            volume_id = %renewed,
+                            "campaign grant-hold renewal pass"
+                        );
+                    }
+                    for lapsed in &report.lapsed {
+                        tracing::warn!(
+                            kind = "lapsed_grant_hold",
+                            migration_id = %lapsed,
+                            "campaign grant-hold pass: a preparation is not uniformly live"
+                        );
+                    }
+                    for (volume_id, detail) in &report.deferred {
+                        tracing::warn!(
+                            kind = "deferred_grant_hold_renewal",
+                            volume_id = %volume_id,
+                            detail = %detail,
+                            "campaign grant-hold renewal deferred"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(
+                        kind = "renew_grant_hold_leases",
+                        error = %error,
+                        "campaign grant-hold renewal pass failed"
                     );
                 }
             }

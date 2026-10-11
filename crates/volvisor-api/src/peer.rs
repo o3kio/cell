@@ -63,6 +63,37 @@
 //!   `Paused` proves a no-resume restore);
 //! - **discard** is proven by the preparation record's absence.
 //!
+//! ## The convergence horizon (the re-mint and the renewal)
+//!
+//! The re-issue above converges only while the witness-side grant
+//! stays **live** — and an unpromoted grant-hold lease was renewed by
+//! nobody (the volume pass renews only volumes with authority
+//! blocks). The horizon remedy closes that gap from both directions
+//! (the diagnosis doc's convergence-horizon section is the design
+//! record):
+//!
+//! - **Renewal during parks**: the daemon's renewal task calls
+//!   [`PeerRouteContext::renew_grant_hold_leases`](crate::peer::PeerRouteContext::renew_grant_hold_leases)
+//!   alongside the
+//!   volume pass — the pre-promote participants of every live
+//!   preparation whose leases are uniformly live get them extended
+//!   (the uniform-liveness coupling and the terminal-shape stops are
+//!   that method's documentation).
+//! - **The gated fresh grant**: when the recorded grant's lease has
+//!   lapsed at the witness (expired, still held by this host) and
+//!   promotes are still needed, the grant act re-issues under a NEW
+//!   derived operation id — the journaled attempt counter folded into
+//!   the reserved namespace (`derived:mig-grant-set-r{n}-…`) — gated
+//!   on ALL of: the witness's authoritative dead-lease report (never
+//!   local inference; a revoked or foreign lease never re-mints), the
+//!   provably pre-promote record (a re-mint retires the granted
+//!   epoch — a completed promote's authority is anchored to it), and
+//!   the source's fence evidence still being the shape the grant left
+//!   (the barrier-or-retirement derivation `promote_target` demands).
+//!   Any refusal is typed and the park keeps its honest spin; the
+//!   witness's own W7 fence window past the lease end is the arbiter
+//!   of when a re-mint may land.
+//!
 //! ## The snapshot directory boundary
 //!
 //! The cutover's v1 snapshot transport is operator-provided shared
@@ -111,7 +142,9 @@ use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
-use volvisor_handoff::{BatchStep, Participant, batch_operation_id};
+use volvisor_handoff::{
+    BatchStep, Participant, batch_operation_id, grant_set_reissue_operation_id,
+};
 use volvisor_provider::handoff::HandoffSurface;
 use volvisor_provider::provider::VolumeProvider;
 use volvisor_provider::vmm::{DiskMapping, VmState, VmmController};
@@ -236,6 +269,11 @@ pub struct PeerRouteContext {
     preparations: TargetPreparationStore,
     /// The configured snapshot root (shared with the peer, plan §6).
     snapshot_root: PathBuf,
+    /// The grant-hold renewal's operation-id nonce (every renewal is
+    /// a distinct journaled witness mutation — a reused id would
+    /// replay a stale remaining duration, so the id mints
+    /// process-unique, like the authority's renew ids).
+    renew_nonce: std::sync::atomic::AtomicU64,
 }
 
 impl PeerRouteContext {
@@ -258,6 +296,7 @@ impl PeerRouteContext {
             host_id,
             preparations,
             snapshot_root: snapshot_root.into(),
+            renew_nonce: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -271,6 +310,197 @@ impl PeerRouteContext {
     #[must_use]
     pub fn snapshot_root(&self) -> &Path {
         &self.snapshot_root
+    }
+
+    /// The durable target-preparation store (the rig's crash-seam
+    /// arming and the tests' inspection surface).
+    #[must_use]
+    pub fn preparations(&self) -> &TargetPreparationStore {
+        &self.preparations
+    }
+
+    /// Renew the grant-hold leases of this destination's live
+    /// preparations — the convergence-horizon remedy's common case
+    /// (the daemon's lease-renewal task calls this alongside the
+    /// volume pass's `DrbdProvider::renew_leases`).
+    ///
+    /// A grant-hold lease is a witness lease the GrantSet minted for
+    /// this host over a volume this destination has **not yet
+    /// promoted** (no recorded device path — the durable proof a
+    /// promote completed). While the migration parks in a pre-promote
+    /// shape, the lease keeps the recorded grant serviceable; the
+    /// volume's own authority block only takes over at the promote's
+    /// completion save, so without this pass an unpromoted lease is
+    /// renewed by nobody and lapses at the TTL — the recorded horizon
+    /// defect.
+    ///
+    /// The pass is deliberately conservative, in both directions:
+    ///
+    /// - **Renewal creates no new authority.** The lease is only
+    ///   extended at the witness (W5: from the renewal time); the
+    ///   grant remains usable exclusively through `promote_target`'s
+    ///   existing live-lease/epoch/fencing gate. A lease is renewed
+    ///   only when the witness shows it live and held by this host —
+    ///   never re-acquired, never re-minted (a lapsed lease is the
+    ///   fresh-grant path's business, driven by the grant act's
+    ///   re-issue, never this pass's).
+    /// - **Renewal stops at terminal shapes.** A promoted participant
+    ///   is skipped (its lease belongs to its volume's own authority
+    ///   block from the promote's completion save onward); a removed
+    ///   preparation is not renewed at all (it is not in the store).
+    ///   No lease outlives its migration record through this pass.
+    /// - **The uniform-liveness coupling.** A preparation's
+    ///   pre-promote leases are renewed only when **every** one is
+    ///   live at the witness: a single dead member makes the batch's
+    ///   grant un-renewable (a lapsed lease cannot be revived — the
+    ///   witness's renew is `STALE_EPOCH`) and would otherwise block
+    ///   the grant act's uniformly-dead fresh-grant gate forever.
+    ///   Letting the surviving members lapse converges the
+    ///   preparation to the uniformly-dead shape within one TTL, at
+    ///   which point the fresh grant may fire. A preparation with a
+    ///   dead member is reported in `lapsed` and skipped whole.
+    /// - **A witness unreachable at renewal time fails honestly**:
+    ///   the member is reported in `deferred` and the pass moves on —
+    ///   the park keeps spinning with unchanged semantics (the next
+    ///   tick retries; the local lease deadlines enforce themselves).
+    ///
+    /// The due rule mirrors the volume pass's cadence without its
+    /// authority block: a lease is due when the witness reports it
+    /// within `renewal_interval_secs` of its end, so a healthy pass
+    /// renews each lease roughly once per `ttl − interval` and the
+    /// lease never enters its final interval while the pass is alive.
+    /// A renewal response that cannot cover the interval (the
+    /// witness's TTL shrank below it) is refused and deferred, the
+    /// same guard the authority's renewal runs.
+    ///
+    /// # Errors
+    /// `INTERNAL` only when the preparation store's lock is poisoned.
+    pub async fn renew_grant_hold_leases(
+        &self,
+        renewal_interval_secs: u64,
+    ) -> Result<GrantHoldRenewalReport, ApiError> {
+        let mut report = GrantHoldRenewalReport::default();
+        for preparation in self.preparations.load_all()? {
+            // Terminal shape: every participant promoted — the
+            // volumes' own authority blocks own the leases now.
+            let pre_promote: Vec<_> = preparation
+                .participants
+                .iter()
+                .filter(|participant| participant.device_path.is_none())
+                .collect();
+            if pre_promote.is_empty() {
+                continue;
+            }
+            // The uniform-liveness gate: view every pre-promote
+            // member first; any non-live (or unobservable) member
+            // skips the preparation whole (see the coupling above).
+            let mut due = Vec::new();
+            let mut uniformly_live = true;
+            for participant in pre_promote {
+                match witness_view(&self.witness, participant.volume_id.clone()).await {
+                    Ok(view)
+                        if view.lease_state == LeaseState::Live
+                            && view.holder.as_ref() == Some(&self.host_id) =>
+                    {
+                        if view.lease_remaining_secs.unwrap_or(0) <= renewal_interval_secs {
+                            due.push((participant.volume_id.clone(), view));
+                        }
+                    }
+                    Ok(_) => uniformly_live = false,
+                    Err(error) => {
+                        report
+                            .deferred
+                            .push((participant.volume_id.clone(), error.detail));
+                        uniformly_live = false;
+                    }
+                }
+            }
+            if !uniformly_live {
+                report.lapsed.push(preparation.migration_id.clone());
+                continue;
+            }
+            for (volume_id, view) in due {
+                let Some(lease_id) = view.lease_id else {
+                    report.deferred.push((
+                        volume_id,
+                        "the witness reported a live lease without its identity".to_owned(),
+                    ));
+                    continue;
+                };
+                match self
+                    .renew_grant_hold_lease(&volume_id, view.current_epoch, lease_id)
+                    .await
+                {
+                    Ok(remaining_secs) if remaining_secs >= renewal_interval_secs => {
+                        report.renewed.push(volume_id);
+                    }
+                    Ok(remaining_secs) => {
+                        report.deferred.push((
+                            volume_id,
+                            format!(
+                                "the witness's renewed lease ({remaining_secs}s) cannot cover \
+                                 the renewal interval ({renewal_interval_secs}s)"
+                            ),
+                        ));
+                    }
+                    Err(error) => {
+                        report.deferred.push((volume_id, error.detail));
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Renew one grant-hold lease at the witness under a fresh
+    /// process-unique operation id (every renewal is a distinct
+    /// journaled mutation), returning the renewed remaining duration.
+    async fn renew_grant_hold_lease(
+        &self,
+        volume_id: &VolumeId,
+        epoch: volvisor_types::WriterEpoch,
+        lease_id: volvisor_types::LeaseId,
+    ) -> Result<u64, ApiError> {
+        let operation_id = self.renewal_operation_id(volume_id)?;
+        let request = volvisor_witness::proto::RenewRequest {
+            protocol_version: WITNESS_PROTOCOL_VERSION,
+            operation_id,
+            host_id: self.host_id.clone(),
+            epoch,
+            lease_id,
+        };
+        let witness = Arc::clone(&self.witness);
+        let volume_id = volume_id.clone();
+        let response =
+            run_blocking(move || witness.renew(&volume_id, request).map_err(witness_error)).await?;
+        Ok(response.remaining_secs)
+    }
+
+    /// Mint the grant-hold renewal's witness operation id:
+    /// `grant-hold-renew-{volume}-{nanos}-{nonce}` — process-unique
+    /// (the authority's renew-id discipline), so every renewal is its
+    /// own journaled mutation and a replayed id can never re-serve a
+    /// stale remaining duration.
+    fn renewal_operation_id(&self, volume_id: &VolumeId) -> Result<OperationId, ApiError> {
+        let nonce = self
+            .renew_nonce
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        // 48 chars cover "-{nanos(20)}-{nonce(20)}" with slack.
+        let prefix: String = format!("grant-hold-renew-{}", volume_id.as_str())
+            .chars()
+            .take(volvisor_types::id::ID_MAX_LEN - 48)
+            .collect();
+        OperationId::new(format!("{prefix}-{nanos}-{nonce}"))
+            .or_else(|_| OperationId::new(format!("grant-hold-renew-{nanos}-{nonce}")))
+            .map_err(|error| {
+                ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!("failed to mint a unique grant-hold renewal id: {error}"),
+                )
+            })
     }
 }
 
@@ -319,6 +549,29 @@ impl axum::extract::FromRequestParts<SharedState> for RequirePeer {
             ))
         }
     }
+}
+
+/// The grant-hold renewal pass's outcome
+/// ([`PeerRouteContext::renew_grant_hold_leases`]) — every entry a
+/// structured event for the daemon's renewal task to log, never a
+/// crash and never a silent skip.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GrantHoldRenewalReport {
+    /// Pre-promote participants whose grant-hold lease this pass
+    /// renewed at the witness.
+    pub renewed: Vec<VolumeId>,
+    /// Preparations skipped whole: at least one pre-promote member's
+    /// lease is not live at the witness (lapsed or unobservable), so
+    /// the remaining members are deliberately allowed to lapse toward
+    /// the grant act's uniformly-dead fresh-grant gate (the
+    /// uniform-liveness coupling; one TTL bounds the convergence).
+    pub lapsed: Vec<MigrationId>,
+    /// Members whose renewal could not be proven or completed this
+    /// pass (the witness unreachable, a lease without identity, or a
+    /// renewal that cannot cover the interval) with the honest
+    /// reason — retried on the next pass, the park's semantics
+    /// unchanged.
+    pub deferred: Vec<(VolumeId, String)>,
 }
 
 /// The `401 UNAUTHORIZED` reply (transport-level code, contract error
@@ -375,6 +628,18 @@ pub struct TargetPreparation {
     /// (the order is part of the deterministic batch operation-id
     /// derivation).
     pub participants: Vec<PreparedParticipant>,
+    /// The GrantSet re-issue attempt counter (the convergence-horizon
+    /// remedy): 0 for every preparation that has never re-minted —
+    /// the grant act's first witness batch runs under the original
+    /// bare operation id — and bumped **durably before** each
+    /// fresh-grant witness call, so a re-drive after a crash
+    /// re-derives the same attempt's reserved-namespace id
+    /// (`derived:mig-grant-set-r{attempt}-…`) and the witness journal
+    /// replays exactly that attempt, never a second grant for one
+    /// attempt. Like `device_path`, this is the grant act's output,
+    /// not the preparation's content (excluded from `content_eq`).
+    #[serde(default)]
+    pub grant_attempt: u64,
     /// Unix epoch seconds at preparation.
     pub created_at: u64,
 }
@@ -418,6 +683,14 @@ impl TargetPreparation {
 #[derive(Clone)]
 pub struct TargetPreparationStore {
     inner: std::sync::Arc<Mutex<StoreInner>>,
+    /// The store-save crash seam (P5 plan §3.1) this store's saves
+    /// consult — created inert here, never armed outside a test rig
+    /// (the doc-gated trust class in `volvisor-types::crash`); the
+    /// constructing rig exposes it via [`Self::store_crash_hooks`]
+    /// and registers its kill switch on the same shared instance.
+    /// Deliberately outside the records lock: the seam is inert
+    /// plumbing, never state.
+    crash: std::sync::Arc<volvisor_types::crash::StoreCrashHooks>,
 }
 
 struct StoreInner {
@@ -494,6 +767,7 @@ impl TargetPreparationStore {
         }
         Ok(Self {
             inner: std::sync::Arc::new(Mutex::new(StoreInner { dir, records })),
+            crash: std::sync::Arc::new(volvisor_types::crash::StoreCrashHooks::new()),
         })
     }
 
@@ -505,7 +779,15 @@ impl TargetPreparationStore {
                 dir: PathBuf::new(),
                 records: BTreeMap::new(),
             })),
+            crash: std::sync::Arc::new(volvisor_types::crash::StoreCrashHooks::new()),
         }
+    }
+
+    /// The store-save crash seam this store's saves consult (P5 plan
+    /// §3.1; test-rig plumbing only — inert unless armed).
+    #[must_use]
+    pub fn store_crash_hooks(&self) -> std::sync::Arc<volvisor_types::crash::StoreCrashHooks> {
+        std::sync::Arc::clone(&self.crash)
     }
 
     /// Look up one preparation.
@@ -515,6 +797,17 @@ impl TargetPreparationStore {
     pub fn load(&self, migration_id: &MigrationId) -> Result<Option<TargetPreparation>, ApiError> {
         let inner = self.lock()?;
         Ok(inner.records.get(migration_id).cloned())
+    }
+
+    /// Every preparation in the store, ordered by migration id — the
+    /// grant-hold renewal pass's input (the live migration records of
+    /// this destination).
+    ///
+    /// # Errors
+    /// `INTERNAL` only when the internal lock is poisoned.
+    pub fn load_all(&self) -> Result<Vec<TargetPreparation>, ApiError> {
+        let inner = self.lock()?;
+        Ok(inner.records.values().cloned().collect())
     }
 
     /// Install one preparation idempotently: absent → persisted;
@@ -545,6 +838,7 @@ impl TargetPreparationStore {
                     format!("failed to serialize peer preparation: {e}"),
                 )
             })?,
+            &self.crash,
         )?;
         inner
             .records
@@ -602,8 +896,45 @@ impl TargetPreparationStore {
                 format!("failed to serialize peer preparation: {e}"),
             )
         })?;
-        save_atomic(&path, &bytes)?;
+        save_atomic(&path, &bytes, &self.crash)?;
         Ok(())
+    }
+
+    /// Begin the next GrantSet re-issue attempt for one migration:
+    /// bump the preparation's journaled attempt counter **durably**
+    /// and return the new attempt number (the fresh-grant witness
+    /// call's operation id is derived from it — the bump landing
+    /// before the call is what makes a re-drive after a crash
+    /// re-derive the same id, so the witness journal replays exactly
+    /// that attempt instead of minting a second grant for it).
+    ///
+    /// Idempotent in the crash-window sense only through the
+    /// caller's discipline: the bump is called exactly once per
+    /// committed decision to re-mint (the grant act's gated path),
+    /// never speculatively — an attempt number whose witness call
+    /// never landed is spent, and the next re-mint derives the next
+    /// number.
+    ///
+    /// # Errors
+    /// `NOT_FOUND` when the preparation is absent; `INTERNAL` on the
+    /// atomic-save failure (the previous record file remains intact).
+    pub fn begin_grant_attempt(&self, migration_id: &MigrationId) -> Result<u64, ApiError> {
+        let mut inner = self.lock()?;
+        let Some(record) = inner.records.get_mut(migration_id) else {
+            return Err(preparation_absent(migration_id));
+        };
+        record.grant_attempt = record.grant_attempt.saturating_add(1);
+        let attempt = record.grant_attempt;
+        let updated = record.clone();
+        let path = record_path(&inner.dir, migration_id);
+        let bytes = serde_json::to_vec_pretty(&updated).map_err(|e| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                format!("failed to serialize peer preparation: {e}"),
+            )
+        })?;
+        save_atomic(&path, &bytes, &self.crash)?;
+        Ok(attempt)
     }
 
     /// Remove one preparation and its file; removing an absent record
@@ -645,8 +976,15 @@ fn record_path(dir: &Path, migration_id: &MigrationId) -> PathBuf {
 
 /// Persist `bytes` at `path` atomically: write `<path>.tmp`
 /// (owner-only `0600` on unix) → fsync → rename over `path` → fsync
-/// the parent directory (the `MigrationStore` discipline).
-fn save_atomic(path: &Path, bytes: &[u8]) -> Result<(), ApiError> {
+/// the parent directory (the `MigrationStore` discipline). The
+/// store-save crash seam (`crash`, P5 plan §3.1) is consulted at the
+/// three deterministic kill points — inert unless the constructing
+/// rig armed this store's seam.
+fn save_atomic(
+    path: &Path,
+    bytes: &[u8],
+    crash: &std::sync::Arc<volvisor_types::crash::StoreCrashHooks>,
+) -> Result<(), ApiError> {
     let internal = |detail: String| ApiError::new(ApiErrorCode::Internal, detail);
     let mut os_name = path.as_os_str().to_owned();
     os_name.push(".tmp");
@@ -658,14 +996,26 @@ fn save_atomic(path: &Path, bytes: &[u8]) -> Result<(), ApiError> {
             .map_err(|e| internal(format!("failed to create {tmp_display}: {e}")))?;
         file.write_all(bytes)
             .map_err(|e| internal(format!("failed to write {tmp_display}: {e}")))?;
+        crash.consult(
+            volvisor_types::crash::STORE_PEER_PREPARATION,
+            volvisor_types::crash::StoreSavePoint::AfterTmpWrite,
+        );
         file.sync_all()
             .map_err(|e| internal(format!("failed to fsync {tmp_display}: {e}")))?;
         drop(file);
+        crash.consult(
+            volvisor_types::crash::STORE_PEER_PREPARATION,
+            volvisor_types::crash::StoreSavePoint::AfterFsyncBeforeRename,
+        );
         fs::rename(&tmp_path, path).map_err(|e| {
             internal(format!(
                 "failed to rename {tmp_display} to {path_display}: {e}"
             ))
         })?;
+        crash.consult(
+            volvisor_types::crash::STORE_PEER_PREPARATION,
+            volvisor_types::crash::StoreSavePoint::AfterRename,
+        );
         let dir = fs::File::open(
             path.parent()
                 .filter(|p| !p.as_os_str().is_empty())
@@ -1074,6 +1424,51 @@ fn id_only_participants(preparation: &TargetPreparation) -> Vec<Participant> {
         .collect()
 }
 
+/// The witness batch operation id of one grant attempt: attempt 0 is
+/// the original bare id ([`batch_operation_id`] — every journal
+/// recorded before the horizon remedy must keep replaying
+/// byte-identically); a re-issue attempt (`n ≥ 1`) renders in the
+/// reserved derived namespace with the journaled counter folded in
+/// ([`grant_set_reissue_operation_id`]).
+fn grant_witness_operation_id(
+    migration_id: &MigrationId,
+    participants: &[Participant],
+    attempt: u64,
+) -> Result<OperationId, ApiError> {
+    if attempt == 0 {
+        batch_operation_id(migration_id, BatchStep::GrantSet, participants)
+    } else {
+        grant_set_reissue_operation_id(migration_id, participants, attempt)
+    }
+}
+
+/// Whether the witness's view of one participant still proves the
+/// migration's source authority fenced — the fresh-grant gate (c),
+/// and exactly the derivation `promote_target` demands at promote
+/// time: a non-voided barrier naming this migration, else the
+/// greatest retired epoch, strictly below the granted (current) one
+/// and durably retired with a recorded commit index. The source's
+/// fence state must still be what the witness recorded when the
+/// grant minted; anything else means the world moved and a fresh
+/// grant must not mint.
+fn source_fence_provable(view: &AuthorityView, migration_id: &MigrationId) -> bool {
+    let source_epoch = view
+        .barriers
+        .iter()
+        .filter(|barrier| !barrier.voided && barrier.migration_id.as_ref() == Some(migration_id))
+        .map(|barrier| barrier.epoch)
+        .max()
+        .or_else(|| view.retirements.iter().map(|retired| retired.epoch).max());
+    let Some(source_epoch) = source_epoch else {
+        return false;
+    };
+    source_epoch < view.current_epoch
+        && view
+            .retirements
+            .iter()
+            .any(|retired| retired.epoch == source_epoch)
+}
+
 // ---------------------------------------------------------------------------
 // verify-lineage
 // ---------------------------------------------------------------------------
@@ -1248,6 +1643,7 @@ fn preparation_from_request(
                 device_path: None,
             })
             .collect(),
+        grant_attempt: 0,
         created_at,
     }
 }
@@ -1452,7 +1848,14 @@ async fn grant_inspect(
     }))
 }
 
-/// The grant act.
+/// The grant act. The whole act is one linear narrative — the
+/// witness views, the branch shape (the serviceable grant, the
+/// horizon's gated re-mint, today's path), the batch, the promotes,
+/// the durable device paths — and its ordering IS its safety
+/// argument (the gates run before any bump, the bump before the
+/// witness call, the paths before the outcome); splitting it into
+/// helpers would hide the order the review certifies.
+#[allow(clippy::too_many_lines)] // the act's linear narrative (above)
 async fn grant_act(
     ctx: Arc<PeerRouteContext>,
     req: PeerGrantRequest,
@@ -1460,15 +1863,160 @@ async fn grant_act(
     let Some(preparation) = ctx.preparations.load(&req.migration_id)? else {
         return Err(preparation_absent(&req.migration_id));
     };
+    // The witness's authoritative view of every participant — the
+    // fresh-grant gates' ONLY input (never inference from local
+    // state), and harmless on the serviceable path (one inspect per
+    // participant; the act is rare).
+    let mut views = Vec::with_capacity(preparation.participants.len());
+    for participant in &preparation.participants {
+        views.push(witness_view(&ctx.witness, participant.volume_id.clone()).await?);
+    }
+    let all_live_ours = views
+        .iter()
+        .zip(&preparation.participants)
+        .all(|(view, _)| {
+            view.lease_state == LeaseState::Live && view.holder.as_ref() == Some(&ctx.host_id)
+        });
+    // Whether any participant still needs the granted lease: a
+    // recorded device path is the durable proof its promote
+    // completed (its promote now replays without a lease); a
+    // participant without one must promote under a live lease.
+    let needs_lease = preparation
+        .participants
+        .iter()
+        .any(|participant| participant.device_path.is_none());
+    let uniformly_our_expired = views
+        .iter()
+        .zip(&preparation.participants)
+        .all(|(view, _)| {
+            view.lease_state == LeaseState::Expired && view.holder.as_ref() == Some(&ctx.host_id)
+        });
+    // Gate (a)'s revoked arm: a revoked lease still recorded held by
+    // THIS host is a DELIBERATE end of this destination's own grant
+    // (an abort's fail-closed release — row 12b's shape), and a
+    // deliberate end is never silently reversed. The re-mint is
+    // gated on the lapsed shape (expired, still this host's); a
+    // revoked-and-ours lease refuses typed before any witness grant
+    // call — never the replay's implicit promote-refusal, and never
+    // the fresh-execution arm (which would mint a new epoch over the
+    // deliberate end): no path converts it. A revoked lease held by
+    // ANOTHER host is the cut's own release (the source's
+    // fail-closed surrender — the ordinary pre-grant shape the
+    // witness grants over past its fence window) and does not fire
+    // this arm.
+    if needs_lease
+        && views.iter().any(|view| {
+            view.lease_state == LeaseState::Revoked && view.holder.as_ref() == Some(&ctx.host_id)
+        })
+    {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidState,
+            format!(
+                "the recorded grant of migration {} is revoked (a deliberate end — an abort's \
+                 fail-closed release); the fresh-grant re-mint is gated on the lapsed shape \
+                 (every participant's lease expired and still held by this host) and no path \
+                 converts a revoked lease — the park is operator territory",
+                req.migration_id
+            ),
+        ));
+    }
     // The witness batch operation id: derived over the ordered
     // participant volume set, exactly like the source's own batch ids,
     // so a re-drive replays the recorded outcome instead of minting a
-    // redundant epoch.
-    let witness_op = batch_operation_id(
-        &req.migration_id,
-        BatchStep::GrantSet,
-        &id_only_participants(&preparation),
-    )?;
+    // redundant epoch. Attempt 0 is the original bare id (every
+    // in-flight journal recorded before the horizon remedy must keep
+    // replaying); a re-issue attempt carries the journaled counter in
+    // the reserved namespace.
+    let witness_op = if all_live_ours || !needs_lease {
+        // The serviceable path (the grant's lease is live and ours,
+        // or every promote already completed and replays without
+        // one): today's semantics, unchanged.
+        grant_witness_operation_id(
+            &req.migration_id,
+            &id_only_participants(&preparation),
+            preparation.grant_attempt,
+        )?
+    } else if uniformly_our_expired {
+        // THE CONVERGENCE HORIZON'S FRESH GRANT: the recorded grant's
+        // lease is provably dead (lapsed at the witness, still held
+        // by this host — never inference, never a foreign or revoked
+        // lease) and promotes are still needed. The re-mint is gated
+        // on ALL of the diagnosis doc's three gates; any refusal is
+        // typed and the park keeps its honest spin.
+        if preparation
+            .participants
+            .iter()
+            .any(|participant| participant.device_path.is_some())
+        {
+            // Gate (b): the re-mint retires the granted epoch, and a
+            // completed promote's authority block is anchored to it —
+            // re-minting would fence a legitimate promote. The
+            // at/after-promote park is operator territory.
+            let promoted = preparation
+                .participants
+                .iter()
+                .filter_map(|p| {
+                    p.device_path
+                        .as_ref()
+                        .map(|path| format!("{} ({path})", p.volume_id))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "the recorded grant of migration {} is no longer live, but its record is at \
+                     or after promote ({promoted}); the fresh-grant re-mint is gated on the \
+                     provably pre-promote park — a re-mint would retire the epoch a completed \
+                     promote's authority is anchored to",
+                    req.migration_id
+                ),
+            ));
+        }
+        if !views
+            .iter()
+            .all(|view| source_fence_provable(view, &req.migration_id))
+        {
+            // Gate (c): the witness re-validates the source's fence
+            // state — the barrier-or-retirement evidence below the
+            // granted epoch, the same derivation promote_target
+            // demands. A fresh grant never mints while the source's
+            // fence evidence has moved.
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "the recorded grant of migration {} is no longer live, but the witness's \
+                     fence evidence for its participants is not the shape the grant left (no \
+                     barrier naming the migration and no retired source epoch below the granted \
+                     one); a fresh grant must never mint while any writer could be live",
+                    req.migration_id
+                ),
+            ));
+        }
+        // Gates hold: bump the journaled attempt counter durably
+        // BEFORE the witness call — a re-drive after a crash
+        // re-derives this attempt's id and the witness journal
+        // replays exactly it, never a second grant for one attempt.
+        let attempt = ctx.preparations.begin_grant_attempt(&req.migration_id)?;
+        grant_set_reissue_operation_id(
+            &req.migration_id,
+            &id_only_participants(&preparation),
+            attempt,
+        )?
+    } else {
+        // Not the uniformly-lapsed shape: the grant may never have
+        // landed (no journal entry — the witness executes it fresh
+        // under the current attempt's id), or the lease is foreign
+        // or mixed — today's semantics in every case: the witness
+        // replays-or-executes and the promotes answer for
+        // themselves (a revoked lease never reaches here: gate (a)'s
+        // revoked arm refuses it typed before the witness call).
+        grant_witness_operation_id(
+            &req.migration_id,
+            &id_only_participants(&preparation),
+            preparation.grant_attempt,
+        )?
+    };
     let grant_request = GrantSetRequest {
         protocol_version: WITNESS_PROTOCOL_VERSION,
         operation_id: witness_op,

@@ -6,7 +6,10 @@ readiness plan §1; this document is the precise mechanics — where the
 failure journals, why it replays forever, and what a re-issue must
 reconcile with. The fix and its safety proofs are PR #23's body; the
 campaign rows that reused the park as an injection window are
-re-derived there.
+re-derived there. The convergence horizon this document recorded as a
+follow-up (below) is closed by PR #33 — the renewal-during-parks and
+gated fresh-grant mechanisms, with their safety statements and honest
+boundaries in that section.
 
 ## The defect in one paragraph
 
@@ -103,22 +106,109 @@ second code path, and would leave the recorded failure sitting in the
 journal as a landmine for the next same-id caller. Re-resolvability
 fixes the class, not the symptom.
 
-## The convergence horizon (the live-lease assumption)
+## The convergence horizon (the live-lease assumption — CLOSED by the horizon remedy)
 
-The re-issue's convergence relies on one world fact: the witness-side
-grant remaining live. The minted grant-hold leases carry the 60 s TTL
-(`DEFAULT_LEASE_TTL_SECS`), and an unpromoted grant is never renewed —
-the destination's renewal pass (`renew_leases`) iterates only its own
-volumes (the ones with authority blocks), and a grant-hold lease for a
-volume the destination never promoted has none. A park that outlives
-the TTL therefore has no re-mint path: the deterministic operation id
-replays the expired grant forever (the witness journal re-serves the
-recorded grant outcome), and `promote_target` refuses over the
-non-live lease — the spin stays honest and fail-closed, but the
-migration no longer self-resolves. The remedy directions — renewing
-unpromoted grant-hold leases while a park is being retried, or minting
-a fresh-grant epoch when the recorded grant's lease is provably dead —
-are a recorded follow-up (readiness plan §1), not shipped in this fix.
+The re-issue's convergence originally relied on one world fact: the
+witness-side grant remaining live. The minted grant-hold leases carry
+the 60 s TTL (`DEFAULT_LEASE_TTL_SECS`), and an unpromoted grant was
+never renewed — the destination's renewal pass (`renew_leases`)
+iterates only its own volumes (the ones with authority blocks), and a
+grant-hold lease for a volume the destination never promoted has
+none. A park that outlived the TTL therefore had no re-mint path: the
+deterministic operation id replayed the expired grant forever (the
+witness journal re-serves the recorded grant outcome), and
+`promote_target` refused over the non-live lease — the spin stayed
+honest and fail-closed, but the migration no longer self-resolved.
+That gap was recorded here as a follow-up and is now **shipped**
+(PR #33); the remedy is both recorded directions,
+composed:
+
+1. **Renewal during parks (the common case).** The daemon's
+   lease-renewal task now renews grant-hold leases alongside volume
+   leases: every live preparation on the destination whose
+   pre-promote participants (those without a recorded device path —
+   the durable proof a promote completed) uniformly hold live leases
+   at the witness gets them renewed, on the same `remaining ≤
+   renewal interval` due rule the volume pass uses (the witness
+   extends from the renewal time, W5). The safety statement: renewal
+   creates **no new authority** — the grant remains usable only
+   through `promote_target`'s existing epoch/fencing gate; renewal
+   only keeps the recorded grant serviceable; renewal **stops at
+   terminal shapes** (a promoted participant's lease belongs to its
+   volume's own authority block from the promote's completion save
+   onward, a removed preparation is not renewed at all — no lease
+   outlives its migration record); and a witness unreachable at
+   renewal time defers honestly to the next pass (the park keeps
+   spinning, unchanged semantics). One coupling is deliberate: the
+   pass renews a preparation's pre-promote leases only when **every**
+   one is live — a single dead member makes the batch's grant
+   un-renewable (`StaleEpoch` cannot revive a lapsed lease) and would
+   otherwise block the fresh-grant gate below forever; letting the
+   remaining members lapse converges the preparation to the
+   uniformly-dead shape within one TTL.
+2. **Fresh-grant on a provably-dead lease (the long-outage case).**
+   When renewal could not keep the lease alive (the witness — or the
+   destination's renewal pass — was down past the TTL) and the world
+   has recovered, the grant act re-issues under a **new derived
+   operation id**: the attempt counter journaled on the preparation
+   (bumped durably before the witness call, so re-drives after
+   crashes agree) folded into a reserved-namespace id
+   (`derived:mig-grant-set-r{attempt}-{16 hex}`, the PR #31
+   discipline; attempt 0 keeps the original bare id byte-identically
+   so in-flight journals replay). The re-mint is gated on **all** of:
+   (a) the witness authoritatively reports every participant's
+   recorded grant lease dead-by-lapse and still ours (state `Expired`
+   with this host as holder — never inference from local state; a
+   `Revoked` lease is a deliberate end — the destination's own
+   fail-closed release or a W6 revocation — and is refused; a live
+   lease is renewal's job, and a foreign or absent lease never
+   reaches this gate); (b) the record is provably pre-promote (no
+   participant records a device path — the re-mint retires the
+   granted epoch, and a completed promote's authority block is
+   anchored to it: re-minting would fence a legitimate promote, so
+   the at/after-promote park is a typed refusal and stays operator
+   territory); (c) the witness re-validates the source's fence state
+   (the barrier-or-retirement evidence below the granted epoch, the
+   same derivation `promote_target` demands — a fresh grant never
+   mints while any writer could be live, and the witness's own W7
+   fence window past the lease end is the arbiter of when the re-mint
+   may land). If any gate fails the refusal is typed and the park
+   keeps its honest spin.
+
+With both, a parked wedge heals regardless of park duration as long
+as the world recovers — the witness's authority is the arbiter
+throughout, no operator action required. The honest boundaries, so
+the close is not silent: the **at/after-promote park** (some
+participant's promote completed before the outage) refuses the
+re-mint (gate b) and remains operator territory — the campaign's
+at-promote scenario records the full shape: the promoted
+participant's resource is SELF-FENCED by the destination's own
+restart reconciliation (every Primary found at startup is unproven
+until its lease validates, and the outage killed the lease), so what
+the operator clears is the fence and the record, never a wedge spin.
+Its fully-promoted
+participants still converge through the promote replay, but the mixed
+park's un-promoted tail needs a lease the re-mint may not mint; the
+**revoked-lease park** (row 12b's fail-closed release) is refused
+(gate a's revoked arm: a lease still recorded held by this
+destination that the witness reports revoked is a deliberate end —
+the refusal is typed BEFORE any witness grant call, so no path
+converts it; a lease revoked by another host is that host's own
+release, the ordinary pre-grant shape the witness grants over) —
+and the
+**mixed-liveness park** (one member lapsed, another still live)
+self-resolves only while it stays undriven: the uniform rule skips
+the whole preparation (the renewal never blocks the gate), so the
+still-live member lapses within one TTL and the uniformly-dead gate
+opens — the review round's composite scenario walks exactly this
+path end to end (the undriven mixed park lapses to uniformly dead
+and converges through the re-mint). Once the drive re-engages over
+a mixed park the boundary is
+different — the still-live member's promote lands under its lease
+(the renewal mechanism's purpose), and the park that remains is the
+mixed at-promote shape: the un-promoted tail's dead lease is refused
+by the re-mint's gate b, a bounded typed spin — operator territory,
+never silently re-opened by re-renewing the survivor.
 
 ## Review notes (PR #23's review)
 

@@ -103,14 +103,24 @@ evidence status stated honestly:
   stall-nuance question in the contract's favor (a
   destination_authorized-shaped stall is self-resolvable by
   construction while the witness-side grant remains live — the 60 s
-  lease TTL; a park that outlives the minted leases (an unpromoted
-  grant-hold lease is never renewed) spins honestly with no re-mint
-  path, and the remedy directions — renewing unpromoted grant-hold
-  leases during a park, or a fresh-grant epoch when the recorded
-  grant's lease is provably dead — are a recorded follow-up, not
-  shipped; so the canonical-state-plus-stall-detail reading holds
-  and `IN_DOUBT` stays reserved for genuinely unresolvable stalls) —
-  the diagnosis is `docs/plans/2026-10-10-grant-set-wedge-diagnosis.md`**;
+  lease TTL; the diagnosis is `docs/plans/2026-10-10-grant-set-wedge-diagnosis.md`;
+  the follow-up that plan recorded — a park that outlives the minted
+  leases (an unpromoted grant-hold lease is never renewed) spinning
+  honestly with no re-mint path — is closed in **PR #33 (the
+  convergence-horizon remedy)**: the destination's renewal task renews
+  the grant-hold leases of its live pre-promote preparations
+  (uniform-liveness coupled, so a preparation with a dead member
+  converges to the shape the gate arbitrates instead of blocking it
+  forever), and when the leases are dead anyway the grant act
+  re-issues behind three witness-authoritative gates (every
+  participant's lease Expired and still this host's, the park
+  provably pre-promote, the cut's fence evidence intact) under a
+  fresh derived operation id — the wedge-horizon campaign scenarios
+  prove both convergences and every honest boundary, so the
+  canonical-state-plus-stall-detail reading holds and `IN_DOUBT`
+  stays reserved for genuinely unresolvable stalls (the at-promote
+  park, the driven mixed park, a world that moved — all operator
+  territory, each proven to spin typed)**;
 - the **renewal-deadline flake** in `volvisor-drbd`
   (`an_unreachable_witness_defers_renewal_until_the_deadline`): observed
   intermittently in earlier full-suite runs (roughly 1-in-20; 0/15 in
@@ -193,19 +203,22 @@ evidence status stated honestly:
 - the **Tier R real-host drive** — the 8 gates are scaffolded, skipped
   honestly, and fail loudly under `VOLVISOR_CAMPAIGN_TIER=R`.
 
-**Closing status (PR #30, 2026-10-10, updated after PR #31).** Every pin
-above reads resolved with its PR pointer — the wedge, both original
-flakes, the row-3 budget, the row-12b race, and the **shared
+**Closing status (PR #30, 2026-10-10, updated after PR #31, then PR
+#33).** Every pin above reads resolved with its PR pointer — the wedge,
+both original flakes, the row-3 budget, the row-12b race, and the **shared
 operation-id namespace** hardening (F5 of PR #23's review, **resolved in
 PR #31**: derived peer ids render in the reserved `derived:` namespace,
 unreachable from the consumer surface, with typed refusals at every
-journaling consumer route) — **except two, listed so the backlog's close
-is honest, not silent**: the **Tier R real-host drive** (scaffolded and
-skipped honestly — hardware-gated, the same class as P9-B, its state
-carried by the campaign's gate records and the nearline §10 note); and
-the wedge resolution's **beyond-TTL re-mint follow-up** (a recorded
-remedy direction in the diagnosis doc, not shipped). The pins move,
-they never disappear.
+journaling consumer route), and the wedge resolution's **beyond-TTL
+re-mint follow-up** is now closed too (**PR #33, the convergence-horizon
+remedy**: grant-hold lease renewal during parks plus the gated
+fresh-grant re-mint behind three witness-authoritative gates, with the
+wedge-horizon campaign scenarios proving the convergences and the honest
+boundaries) — **except one, listed so the backlog's close is honest, not
+silent**: the **Tier R real-host drive** (scaffolded and skipped honestly
+— hardware-gated, the same class as P9-B, its state carried by the
+campaign's gate records and the nearline §10 note). The pins move, they
+never disappear.
 
 **Decision (D1):** the next phases are P6–P9 as defined in §6 (native
 online operations, packaging/distribution, the real-VMM verification tier,

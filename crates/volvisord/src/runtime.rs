@@ -117,12 +117,6 @@ pub fn build_state(config: &Config) -> Result<SharedState, DaemonError> {
         }
         ProviderKind::Drbd => {
             let provider = Arc::new(drbd_provider(config)?);
-            // Witness management (P4a plan §6): the background renewal
-            // task enforces the local W5 deadline and renews due
-            // leases; failures surface as events, never crashes.
-            if config.witness_url.is_some() {
-                spawn_renewal_task(&provider);
-            }
             let adoption: Arc<dyn AdoptionSurface> = provider.clone();
             // The provider's handoff surface is attached whenever the
             // provider is the DRBD engine (check-mobility is a
@@ -139,16 +133,31 @@ pub fn build_state(config: &Config) -> Result<SharedState, DaemonError> {
             // the source-side drive, plus the internal peer routes
             // for the destination side) — and the retry task owns the
             // periodic reconcile.
+            let mut grant_holds = None;
             if config.migration.enabled {
                 let (handle, peer_ctx) = wire_daemon_migration(config, &provider)?;
                 state = state
                     .with_migration(handle.clone())
-                    .with_peer_routes(config.migration.peer_api_token.clone(), peer_ctx);
+                    .with_peer_routes(config.migration.peer_api_token.clone(), peer_ctx.clone());
+                grant_holds = Some(peer_ctx);
                 // Detached by design (the renewal-task pattern): the
                 // task owns the periodic reconcile for the daemon's
                 // lifetime and never fails the startup that spawned
                 // it — every outcome is a structured event.
                 let _detached = spawn_migration_retry_task(handle);
+            }
+            // Witness management (P4a plan §6): the background renewal
+            // task enforces the local W5 deadline and renews due
+            // leases; failures surface as events, never crashes. It
+            // spawns after the migration wiring above because its
+            // grant-hold leg (the convergence-horizon remedy) renews
+            // the pre-promote leases of live preparations through the
+            // peer context — present exactly when migration is
+            // enabled; the first tick is a full interval of slack, so
+            // the ordering is load-bearing only for composition, not
+            // for timing.
+            if config.witness_url.is_some() {
+                spawn_renewal_task(&provider, config.witness_renewal_interval_secs, grant_holds);
             }
             state
         }
@@ -682,9 +691,21 @@ fn wire_daemon_migration(
 /// [`RENEWAL_TICK`] — `renew_leases` itself throttles actual renewals
 /// to the configured interval and checks the W5 deadline on every
 /// pass — and surfaces every outcome as a structured event (renewals,
-/// self-fences, deferrals and pass failures), never as a crash.
-fn spawn_renewal_task(provider: &Arc<DrbdProvider>) {
+/// self-fences, deferrals and pass failures), never as a crash. The
+/// grant-hold leg (the convergence-horizon remedy) runs in the same
+/// tick whenever the daemon is migration-wired and the renewal
+/// interval is configured: the pre-promote leases of live
+/// preparations are extended alongside the volume leases, with the
+/// same event discipline (renewals, lapses toward the fresh-grant
+/// gate, deferrals).
+fn spawn_renewal_task(
+    provider: &Arc<DrbdProvider>,
+    renewal_interval_secs: Option<u64>,
+    grant_holds: Option<Arc<PeerRouteContext>>,
+) {
     let provider = Arc::clone(provider);
+    let grant_holds = grant_holds.filter(|_| renewal_interval_secs.is_some());
+    let renewal_interval_secs = renewal_interval_secs.unwrap_or(0);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(RENEWAL_TICK).await;
@@ -734,6 +755,43 @@ fn spawn_renewal_task(provider: &Arc<DrbdProvider>) {
                 }
                 Err(error) => {
                     tracing::error!(kind = "renew_leases", error = %error, "renewal pass failed");
+                }
+            }
+            if let Some(context) = &grant_holds {
+                match context.renew_grant_hold_leases(renewal_interval_secs).await {
+                    Ok(report) => {
+                        for renewed in &report.renewed {
+                            tracing::info!(
+                                kind = "renew_grant_hold",
+                                volume_id = %renewed,
+                                "witness grant-hold lease renewed"
+                            );
+                        }
+                        for lapsed in &report.lapsed {
+                            tracing::warn!(
+                                kind = "lapsed_grant_hold",
+                                migration_id = %lapsed,
+                                "a preparation's grant-hold lease is not uniformly live; \
+                                 its remaining members are allowed to lapse toward the \
+                                 fresh-grant gate"
+                            );
+                        }
+                        for (volume_id, detail) in &report.deferred {
+                            tracing::warn!(
+                                kind = "deferred_grant_hold_renewal",
+                                volume_id = %volume_id,
+                                detail = %detail,
+                                "grant-hold renewal deferred; retried next pass"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            kind = "renew_grant_hold_leases",
+                            error = %error,
+                            "grant-hold renewal pass failed"
+                        );
+                    }
                 }
             }
         }

@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use volvisor_handoff::{
     BatchStep, Clock, CutProgress, HandoffDriver, HandoffState, MigrationCoordinator,
     MigrationRecord, MigrationStore, Participant, PrepareHandoffRequest, barrier_operation_id,
-    batch_operation_id, void_barrier_operation_id,
+    batch_operation_id, grant_set_reissue_operation_id, void_barrier_operation_id,
 };
 use volvisor_types::authority::{
     AuthorityView, BarrierAttestation, EpochRetirement, LeaseState, RecordedMigrationBarrier,
@@ -1698,6 +1698,65 @@ async fn coordinator_uses_deterministic_op_ids() {
     assert_eq!(
         barrier_operation_id(&migration, &vol_a).expect("derive"),
         barrier_operation_id(&migration, &vol_a).expect("derive")
+    );
+}
+
+/// The GrantSet re-issue id (the convergence-horizon remedy): the
+/// attempt counter folds into the id — every attempt mints a distinct
+/// id (the witness journal never replays one attempt's grant as
+/// another's), the id is deterministic in all its inputs (a re-drive
+/// after a crash re-derives it exactly), it renders in the reserved
+/// `derived:` namespace (PR #31's discipline), and it never collides
+/// with the original bare batch id — attempt 0's — nor across
+/// migrations or participant sets.
+#[test]
+fn grant_set_reissue_operation_ids_are_deterministic_and_attempt_folded() {
+    let migration = migration_id();
+    let parts = participants(&VOLS);
+    let first = grant_set_reissue_operation_id(&migration, &parts, 1).expect("derive");
+    // Deterministic in every input.
+    assert_eq!(
+        first,
+        grant_set_reissue_operation_id(&migration, &parts, 1).expect("derive")
+    );
+    // The attempt counter folds in: every attempt is a distinct id.
+    assert_ne!(
+        first,
+        grant_set_reissue_operation_id(&migration, &parts, 2).expect("derive")
+    );
+    assert_ne!(
+        first,
+        grant_set_reissue_operation_id(&migration, &parts, 3).expect("derive")
+    );
+    // The reserved namespace and the visible attempt marker.
+    let raw = first.as_str();
+    assert!(
+        raw.starts_with("derived:mig-grant-set-r1-"),
+        "the re-issue id renders in the reserved namespace with its attempt: {raw}"
+    );
+    assert!(
+        grant_set_reissue_operation_id(&migration, &parts, 2)
+            .expect("derive")
+            .as_str()
+            .starts_with("derived:mig-grant-set-r2-")
+    );
+    // Never the original bare batch id (attempt 0 keeps it
+    // byte-identically for in-flight journals).
+    let original = batch_operation_id(&migration, BatchStep::GrantSet, &parts).expect("derive");
+    assert_ne!(first.as_str(), original.as_str());
+    assert!(!original.as_str().starts_with("derived:"));
+    // Distinct across migrations and participant sets (the ordered
+    // volume list folds in, exactly like the original).
+    assert_ne!(
+        first,
+        grant_set_reissue_operation_id(&MigrationId::new("mig-2").expect("valid id"), &parts, 1)
+            .expect("derive")
+    );
+    let reordered: Vec<_> = participants(&VOLS).iter().rev().cloned().collect();
+    assert_ne!(
+        first,
+        grant_set_reissue_operation_id(&migration, &reordered, 1).expect("derive"),
+        "the ordered participant set folds into the re-issue id"
     );
 }
 
