@@ -1081,6 +1081,54 @@ mod tests {
         assert_eq!(gate_from(Some("1")), Gate::Claimed);
     }
 
+    /// The components render names the optional legacy binary with
+    /// its own stamps and role when claimed, and carries no
+    /// `legacy_cloud_hypervisor` key otherwise — the boundary leg's
+    /// presence in a record is exactly the claim's (PR #32; the
+    /// stamps follow ADR-0010's discipline: a probed binary is
+    /// never an anonymous `--version` output).
+    #[test]
+    fn the_components_render_names_the_legacy_binary_only_when_claimed() {
+        let base = || RealVmmEnv {
+            cloud_hypervisor: PathBuf::from("/usr/bin/cloud-hypervisor"),
+            ch_remote: PathBuf::from("/usr/bin/ch-remote"),
+            kernel: PathBuf::from("/boot/vmlinuz-test"),
+            initramfs: PathBuf::from("/boot/initrd.img-test"),
+            kvm: PathBuf::from("/dev/kvm"),
+            cloud_hypervisor_version: "cloud-hypervisor v51.1".to_owned(),
+            ch_remote_version: "ch-remote v51.1".to_owned(),
+            cloud_hypervisor_sha256: "a".repeat(64),
+            ch_remote_sha256: "b".repeat(64),
+            legacy_cloud_hypervisor: None,
+        };
+        let unclaimed = base().components_value();
+        assert!(
+            unclaimed["vmm"]["legacy_cloud_hypervisor"].is_null(),
+            "an unclaimed legacy binary leaves no stamp: {unclaimed}"
+        );
+        let mut claimed = base();
+        claimed.legacy_cloud_hypervisor = Some(LegacyCloudHypervisor {
+            path: PathBuf::from("/usr/bin/cloud-hypervisor-v43"),
+            version: "cloud-hypervisor v43.0.0".to_owned(),
+            sha256: "c".repeat(64),
+        });
+        let stamp = &claimed.components_value()["vmm"]["legacy_cloud_hypervisor"];
+        assert_eq!(stamp["version"], "cloud-hypervisor v43.0.0");
+        assert_eq!(stamp["sha256"], "c".repeat(64));
+        assert!(
+            stamp["path"]
+                .as_str()
+                .is_some_and(|path| Path::new(path).is_absolute()),
+            "the stamp names an absolute path: {stamp}"
+        );
+        assert!(
+            stamp["role"]
+                .as_str()
+                .is_some_and(|role| role.contains("never a launched VMM")),
+            "the stamp states the leg's role: {stamp}"
+        );
+    }
+
     /// A claimed gate without a backing environment fails loudly
     /// with the detection's own detail (never a silent pass).
     #[test]
