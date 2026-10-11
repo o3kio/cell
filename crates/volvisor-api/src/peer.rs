@@ -73,7 +73,8 @@
 //! record):
 //!
 //! - **Renewal during parks**: the daemon's renewal task calls
-//!   [`PeerRouteContext::renew_grant_hold_leases`] alongside the
+//!   [`PeerRouteContext::renew_grant_hold_leases`](crate::peer::PeerRouteContext::renew_grant_hold_leases)
+//!   alongside the
 //!   volume pass — the pre-promote participants of every live
 //!   preparation whose leases are uniformly live get them extended
 //!   (the uniform-liveness coupling and the terminal-shape stops are
@@ -320,8 +321,8 @@ impl PeerRouteContext {
 
     /// Renew the grant-hold leases of this destination's live
     /// preparations — the convergence-horizon remedy's common case
-    /// (the daemon's lease-renewal task calls this alongside
-    /// [`DrbdProvider::renew_leases`](volvisor_drbd::DrbdProvider::renew_leases)).
+    /// (the daemon's lease-renewal task calls this alongside the
+    /// volume pass's `DrbdProvider::renew_leases`).
     ///
     /// A grant-hold lease is a witness lease the GrantSet minted for
     /// this host over a volume this destination has **not yet

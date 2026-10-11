@@ -96,14 +96,17 @@ the readiness plan §6):
   `IN_DOUBT` stall-nuance question is resolved by PR #23's wedge fix
   (P6-A part 3): with a destination_authorized-shaped stall
   self-resolvable by construction while the witness-side grant
-  remains live (the 60 s lease TTL; a park that outlives the minted
-  leases spins honestly with no re-mint path — the remedy
-  directions are a recorded follow-up, see the diagnosis doc's
-  convergence-horizon section), the nearline §6 reading holds as
+  remains live (the 60 s lease TTL), the nearline §6 reading holds as
   written — the canonical state plus a stall detail for resolvable
   stalls, `IN_DOUBT` reserved for genuinely unresolvable ones (row
   12b's shape); no contract change is needed, and the campaign's
-  findings record the resolution**.
+  findings record the resolution. The follow-up that fix recorded —
+  a park that outlives the minted leases spinning honestly with no
+  re-mint path — is closed in PR #33 (the convergence-horizon
+  remedy): grant-hold lease renewal during parks (uniform-liveness
+  coupled) plus the gated fresh-grant re-mint behind three
+  witness-authoritative gates, per the diagnosis doc's
+  convergence-horizon section**.
 
 **Test/evidence shape.** A fix lands with a test that fails on the old
 behavior (a reproduction for the flakes; a wedge-recovery scenario for the
@@ -518,7 +521,7 @@ asserts nothing the artifacts do not already carry.
 
 | Stage | PR(s) | Outcome | Evidence |
 |---|---|---|---|
-| P6-A hardening slice | #21–#23 | delivered | the flake fixes and the row-3 budget amendment (#21), the F1 lineage re-check (#22), the grant_set wedge fix — re-resolvable peer acts — with the campaign's rows 7–8 re-derived ([the diagnosis](2026-10-10-grant-set-wedge-diagnosis.md); the healed cells' records in the campaign suite's `rows_8_14.rs` and `summary.rs`) |
+| P6-A hardening slice | #21–#23, #33 | delivered | the flake fixes and the row-3 budget amendment (#21), the F1 lineage re-check (#22), the grant_set wedge fix — re-resolvable peer acts — with the campaign's rows 7–8 re-derived ([the diagnosis](2026-10-10-grant-set-wedge-diagnosis.md); the healed cells' records in the campaign suite's `rows_8_14.rs` and `summary.rs`), and the convergence-horizon closure (#33) — grant-hold lease renewal during parks plus the gated fresh-grant re-mint, with the wedge-horizon scenarios proving the convergences and the honest boundaries (the diagnosis doc's horizon section; the campaign suite's `wedge_horizon.rs`) |
 | P6-B grow-notification | #20 | delivered | the `vm.resize-disk` path with the pinned version gate and the real `guest_notification_status` machine (`volvisor-provider`'s `grow_tests.rs` + the byte-exact `vmm_tests.rs`) |
 | P6-C same-VG pvmove | #24 | delivered | `MoveVolumeBackingOnline` end to end: 33 provider-semantics tests (`volvisor-lvm`'s `move_tests.rs`), 5 daemon rows (`volvisord`'s `move_e2e.rs`), the campaign's row 16 (`move_rows.rs`), the `VOLVISOR_TEST_LVM=1` integration quartet |
 | P7-A version/config | #19 | delivered | `--version` / `--check-config` surfaces, [configuration.md](../configuration.md) + the `examples/` configs, asserted in CI |
@@ -564,9 +567,15 @@ this section was first drafted and is now **resolved in PR #32**: the
 `notified` leg is recorded from a real observation against the pinned
 upstream v51.1 binary, with the version-gate boundary recorded both
 ways (`docs/evidence/tier-v/2026-10-11-devhost-v51/`). The grant_set
-wedge's convergence horizon: a park that outlives the 60 s lease TTL
-spins honestly with no re-mint path — the remedy directions are
-recorded in the diagnosis doc, not shipped. One backlog pin the phase
+wedge's convergence horizon was open when this section was first
+drafted and is now **resolved in PR #33**: a park that outlives the
+60 s lease TTL no longer spins without recourse — the destination
+renews the grant-hold leases of its live pre-promote preparations
+during the park, and when the leases are dead anyway the grant act
+re-issues behind three witness-authoritative gates under a fresh
+derived operation id (the diagnosis doc's horizon section records the
+remedy, the campaign suite's `wedge_horizon.rs` proves the
+convergences and the honest boundaries). One backlog pin the phase
 leaves open, recorded rather than silently dropped: the Tier R
 real-host drive (scaffolded, skipped honestly, hardware-gated — the
 campaign's gate records and the nearline §10 note carry its state). The

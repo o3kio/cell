@@ -119,8 +119,8 @@ deterministic operation id replayed the expired grant forever (the
 witness journal re-serves the recorded grant outcome), and
 `promote_target` refused over the non-live lease — the spin stayed
 honest and fail-closed, but the migration no longer self-resolved.
-That gap was recorded here as a follow-up and is now **shipped** (the
-PR that closes this section); the remedy is both recorded directions,
+That gap was recorded here as a follow-up and is now **shipped**
+(PR #33); the remedy is both recorded directions,
 composed:
 
 1. **Renewal during parks (the common case).** The daemon's
@@ -180,15 +180,27 @@ as the world recovers — the witness's authority is the arbiter
 throughout, no operator action required. The honest boundaries, so
 the close is not silent: the **at/after-promote park** (some
 participant's promote completed before the outage) refuses the
-re-mint (gate b) and remains operator territory — its fully-promoted
+re-mint (gate b) and remains operator territory — the campaign's
+at-promote scenario records the full shape: the promoted
+participant's resource is SELF-FENCED by the destination's own
+restart reconciliation (every Primary found at startup is unproven
+until its lease validates, and the outage killed the lease), so what
+the operator clears is the fence and the record, never a wedge spin.
+Its fully-promoted
 participants still converge through the promote replay, but the mixed
 park's un-promoted tail needs a lease the re-mint may not mint; the
 **revoked-lease park** (row 12b's fail-closed release) is refused
 (gate a) — a deliberate end is never silently reversed; and the
 **mixed-liveness park** (one member lapsed, another still live)
-spins until the still-live member lapses (the renewal's uniform rule
-above) and the uniformly-dead gate opens — bounded by one TTL, never
-an operator action.
+self-resolves only while it stays undriven: the uniform rule skips
+the whole preparation (the renewal never blocks the gate), so the
+still-live member lapses within one TTL and the uniformly-dead gate
+opens. Once the drive re-engages over a mixed park the boundary is
+different — the still-live member's promote lands under its lease
+(the renewal mechanism's purpose), and the park that remains is the
+mixed at-promote shape: the un-promoted tail's dead lease is refused
+by the re-mint's gate b, a bounded typed spin — operator territory,
+never silently re-opened by re-renewing the survivor.
 
 ## Review notes (PR #23's review)
 
